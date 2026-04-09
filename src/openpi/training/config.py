@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.e6_policy as e6_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -451,6 +452,40 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotE6DataConfig(DataConfigFactory):
+    """Data config for a custom E6 LeRobot dataset."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/state": "state",
+                        # Map LeRobot ``action`` -> openpi ``actions`` for downstream transforms.
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # E6 v1 uses 6 joint deltas + 1 gripper command directly in the dataset actions.
+        data_transforms = _transforms.Group(
+            inputs=[e6_policy.E6Inputs(model_type=model_config.model_type)],
+            outputs=[e6_policy.E6Outputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -915,6 +950,61 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        # E6 v1: single exterior camera, 7D state/action contract, primitive task strings from LeRobot tasks.
+        name="pi05_e6_v1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # Keep pi05 internal action dimension.
+            action_horizon=16,
+            discrete_state_input=False,
+        ),
+        data=LeRobotE6DataConfig(
+            # Same repo_id as examples/e6/convert_e6_episode_to_lerobot.py DEFAULT_REPO_ID.
+            repo_id="billy/dobot_e6_pick_place_random_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # LeRobot datasets usually use the ``action`` column name (not ``actions``).
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # π0.5 + LoRA (E6): freeze SigLIP + full Gemma stacks; train only action-expert LoRA + small action heads.
+        # See :func:`openpi.models.pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only` (not
+        # :meth:`Pi0Config.get_freeze_filter`, which would leave the vision tower and main LLM trainable).
+        name="pi05_e6_v1_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="billy/dobot_e6_pick_place_random_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            # Reuse norm stats from ``compute_norm_stats.py --config-name pi05_e6_v1`` (same dataset).
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v1",
+                asset_id="billy/dobot_e6_pick_place_random_v1",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        # Default to 1 for OOM-safe smoke runs; ramp batch on the CLI (2, 4, 8, …) after checking loss/checkpoints.
+        batch_size=1,
+        log_interval=50,
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

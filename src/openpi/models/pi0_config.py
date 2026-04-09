@@ -115,3 +115,23 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+def freeze_filter_vlm_frozen_action_expert_lora_only() -> nnx.filterlib.Filter:
+    """Freeze all of ``PaliGemma`` except action-expert LoRA, for narrow π0.5 fine-tuning.
+
+    Use with ``paligemma_variant="gemma_2b"`` and ``action_expert_variant="gemma_300m_lora"``.
+
+    :meth:`Pi0Config.get_freeze_filter` does not freeze SigLIP (``PaliGemma/img``) or the main Gemma stack when only
+    the action expert has LoRA, which would train the full vision-language tower. This filter freezes both the image
+    encoder and all LLM base weights, while keeping trainable only (1) LoRA tensors on the action expert (paths
+    matching both ``lora`` and ``_1``) and (2) the small action-side heads (``action_in_proj``, ``time_mlp_*``,
+    ``action_out_proj``), which live outside ``PaliGemma``.
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    img = nnx_utils.PathRegex("PaliGemma/img/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    return nnx.Any(img, freeze_llm)

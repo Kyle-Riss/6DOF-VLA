@@ -81,6 +81,23 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     )
 
 
+def _log_trainable_param_paths(config: _config.TrainConfig, params: nnx.State, *, max_paths: int = 256) -> None:
+    """Log how many tensors are trainable and their paths (for verifying ``freeze_filter``)."""
+    trainable = params.filter(config.trainable_filter)
+    flat = trainable.flat_state()
+    keys = sorted(flat.keys(), key=lambda k: "/".join(str(x) for x in k))
+    n = len(keys)
+    logging.info(f"Trainable parameter tensors: {n} (check that these match your freeze intent)")
+    for i, k in enumerate(keys):
+        if i >= max_paths:
+            logging.info(
+                f"  ... {n - max_paths} more paths not shown (see scripts/train.py::_log_trainable_param_paths)"
+            )
+            break
+        path_str = "/".join(str(x) for x in k)
+        logging.info(f"  trainable: {path_str}")
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -239,6 +256,8 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    _log_trainable_param_paths(config, train_state.params)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),

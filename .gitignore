@@ -4,6 +4,15 @@ checkpoints/
 data/
 wandb/
 
+# Large / local-only artifacts (weights live under checkpoints/ or separate storage)
+**/*.safetensors
+*.pid
+preview_e6_*/
+.pytest_cache_openpi/
+
+# JAX
+.jax_cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
