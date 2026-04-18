@@ -11,6 +11,7 @@ def make_e6_example() -> dict:
     """Creates a random input example for an E6-style policy."""
     return {
         "observation/exterior_image_1_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/exterior_image_2_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/state": np.random.rand(7),
         "prompt": "approach red object",
     }
@@ -31,18 +32,18 @@ class E6Inputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
-        base_image = _parse_image(data["observation/exterior_image_1_left"])
+        hik_image = _parse_image(data["observation/exterior_image_1_left"])
+        zed_image = _parse_image(data["observation/exterior_image_2_left"])
 
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                # E6 v1 uses only one top/exterior camera.
-                images = (base_image, np.zeros_like(base_image), np.zeros_like(base_image))
-                image_masks = (np.True_, np.False_, np.False_)
+                # HIK → base slot, ZED → left_wrist slot; right_wrist padded with zeros.
+                images = (hik_image, zed_image, np.zeros_like(hik_image))
+                image_masks = (np.True_, np.True_, np.False_)
             case _model.ModelType.PI0_FAST:
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
-                images = (base_image, np.zeros_like(base_image), np.zeros_like(base_image))
-                # FAST models do not use image masking for padded views.
+                images = (hik_image, zed_image, np.zeros_like(hik_image))
                 image_masks = (np.True_, np.True_, np.True_)
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")

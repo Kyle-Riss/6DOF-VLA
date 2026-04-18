@@ -4,15 +4,18 @@ Convert Dobot Magician E6 (or compatible) raw episode folders to LeRobot format 
 Expected layout per episode directory::
 
     episode_dir/
-      images/              # frame images (e.g. frame_000000.jpg)
-      robot_data.csv       # columns include j1..j6, gripper_tooldo1, image_path, timestamp, ...
+      images/hik/          # HIK camera frames (e.g. frame_000000.jpg)
+      images/zed/          # ZED camera frames (e.g. frame_000000.jpg)
+      robot_data.csv       # columns include j1..j6, gripper_tooldo1,
+                           #   image_path_hik, image_path_zed, timestamp, ...
       metadata.txt         # optional (not parsed by default)
 
 Per-frame contract (matches openpi ``LeRobotE6DataConfig`` + ``E6Inputs``):
 
-* ``exterior_image_1_left``: top camera, dtype image (CHW uint8 after load)
+* ``exterior_image_1_left``: HIK side camera (whole arm visible), dtype image (CHW uint8)
+* ``exterior_image_2_left``: ZED side camera (object-focused), dtype image (CHW uint8)
 * ``state``: (7,) float32 — [j1..j6, gripper_tooldo1]
-* ``action``: (7,) float32 — [Δj1..Δj6, gripper(t+1)] using rows t and t+1
+* ``action``: (7,) float32 — [j1..j6, gripper_tooldo1] at t+1 (absolute, not delta)
 * ``task``: natural-language string per frame, or one string for all frames when not using
   ``--primitive-v1`` (see below).
 
@@ -71,10 +74,11 @@ import e6_v1_task_contract as _v1
 # Must match ``TrainConfig(pi05_e6_v1).data.repo_id`` so training loads this LeRobot dataset.
 DEFAULT_REPO_ID = "billy/dobot_e6_pick_place_random_v1"
 
-# Default CSV columns (override with --joint-cols / --gripper-col / --image-col if needed)
+# Default CSV columns (override with CLI flags if needed)
 JOINT_COLS_DEFAULT = ("j1", "j2", "j3", "j4", "j5", "j6")
 GRIPPER_COL_DEFAULT = "gripper_tooldo1"
-IMAGE_COL_DEFAULT = "image_path"
+IMAGE_COL_HIK_DEFAULT = "image_path_hik"
+IMAGE_COL_ZED_DEFAULT = "image_path_zed"
 
 
 def _load_image_chw(path: Path, resize: int | None) -> np.ndarray:
@@ -109,8 +113,9 @@ def main(
     images_subdir: str = "images",
     joint_cols: tuple[str, ...] = JOINT_COLS_DEFAULT,
     gripper_col: str = GRIPPER_COL_DEFAULT,
-    image_col: str = IMAGE_COL_DEFAULT,
-    fps: int = 20,
+    image_col_hik: str = IMAGE_COL_HIK_DEFAULT,
+    image_col_zed: str = IMAGE_COL_ZED_DEFAULT,
+    fps: int = 18,  # actual control Hz is 18.335; LeRobot requires int
     robot_type: str = "magician_e6",
     resize: int | None = 224,
     clean: bool = True,
@@ -137,16 +142,24 @@ def main(
     if clean and output_root.exists():
         shutil.rmtree(output_root)
 
-    # Infer image shape from first frame of first episode
+    # Infer image shapes from first frame of first episode (HIK and ZED may differ natively)
     df0 = _read_episode_csv(episode_paths[0], csv_name)
-    first_img = episode_paths[0] / images_subdir / str(df0[image_col].iloc[0])
-    sample = _load_image_chw(first_img, resize=resize)
-    _, h, w = sample.shape
+    first_hik = episode_paths[0] / images_subdir / str(df0[image_col_hik].iloc[0])
+    first_zed = episode_paths[0] / images_subdir / str(df0[image_col_zed].iloc[0])
+    sample_hik = _load_image_chw(first_hik, resize=resize)
+    sample_zed = _load_image_chw(first_zed, resize=resize)
+    _, h_hik, w_hik = sample_hik.shape
+    _, h_zed, w_zed = sample_zed.shape
 
     features = {
-        "exterior_image_1_left": {
+        "exterior_image_1_left": {  # HIK: side camera, full arm view
             "dtype": "image",
-            "shape": (3, h, w),
+            "shape": (3, h_hik, w_hik),
+            "names": ["channel", "height", "width"],
+        },
+        "exterior_image_2_left": {  # ZED: side camera, object-focused
+            "dtype": "image",
+            "shape": (3, h_zed, w_zed),
             "names": ["channel", "height", "width"],
         },
         "state": {
@@ -157,7 +170,7 @@ def main(
         "action": {
             "dtype": "float32",
             "shape": (7,),
-            "names": ["d_j1", "d_j2", "d_j3", "d_j4", "d_j5", "d_j6", "gripper_cmd"],
+            "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper_cmd"],
         },
     }
 
@@ -173,7 +186,7 @@ def main(
 
     for ep_idx, ep in enumerate(episode_paths):
         df = _read_episode_csv(ep, csv_name)
-        missing = [c for c in [*joint_cols, gripper_col, image_col] if c not in df.columns]
+        missing = [c for c in [*joint_cols, gripper_col, image_col_hik, image_col_zed] if c not in df.columns]
         if missing:
             raise ValueError(f"{ep}: CSV missing columns {missing}. Found: {list(df.columns)}")
 
@@ -201,27 +214,34 @@ def main(
 
             cur = df.iloc[t]
             nxt = df.iloc[t + 1]
-            img_path = ep / images_subdir / str(cur[image_col])
-            if not img_path.is_file():
-                raise FileNotFoundError(f"Missing image {img_path}")
+            hik_path = ep / images_subdir / str(cur[image_col_hik])
+            zed_path = ep / images_subdir / str(cur[image_col_zed])
+            if not hik_path.is_file():
+                raise FileNotFoundError(f"Missing HIK image {hik_path}")
+            if not zed_path.is_file():
+                raise FileNotFoundError(f"Missing ZED image {zed_path}")
 
             joints_cur = np.array([float(cur[c]) for c in joint_cols], dtype=np.float32)
             joints_nxt = np.array([float(nxt[c]) for c in joint_cols], dtype=np.float32)
             g_cur = np.float32(cur[gripper_col])
             g_nxt = np.float32(nxt[gripper_col])
             state = np.concatenate([joints_cur, np.array([g_cur], dtype=np.float32)])
-            delta = joints_nxt - joints_cur
-            action = np.concatenate([delta, np.array([g_nxt], dtype=np.float32)])
+            action = np.concatenate([joints_nxt, np.array([g_nxt], dtype=np.float32)])
 
-            img_chw = _load_image_chw(img_path, resize=resize)
-            if img_chw.shape != (3, h, w):
+            hik_chw = _load_image_chw(hik_path, resize=resize)
+            zed_chw = _load_image_chw(zed_path, resize=resize)
+            if hik_chw.shape != (3, h_hik, w_hik):
                 raise ValueError(
-                    f"Image shape mismatch in {img_path}: {img_chw.shape} vs (3, {h}, {w}). "
-                    "Use a fixed --resize or consistent camera resolution."
+                    f"HIK image shape mismatch in {hik_path}: {hik_chw.shape} vs (3, {h_hik}, {w_hik})."
+                )
+            if zed_chw.shape != (3, h_zed, w_zed):
+                raise ValueError(
+                    f"ZED image shape mismatch in {zed_path}: {zed_chw.shape} vs (3, {h_zed}, {w_zed})."
                 )
 
             frame = {
-                "exterior_image_1_left": img_chw,
+                "exterior_image_1_left": hik_chw,
+                "exterior_image_2_left": zed_chw,
                 "state": state,
                 "action": action,
                 "task": task_str,

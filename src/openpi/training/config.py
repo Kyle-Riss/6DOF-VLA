@@ -474,6 +474,7 @@ class LeRobotE6DataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
                         "observation/state": "state",
                         # Map LeRobot ``action`` -> openpi ``actions`` for downstream transforms.
                         "actions": "action",
@@ -999,10 +1000,11 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
-        # Default to 1 for OOM-safe smoke runs; ramp batch on the CLI (2, 4, 8, …) after checking loss/checkpoints.
-        batch_size=1,
+        num_train_steps=32_000,
+        batch_size=8,
         log_interval=50,
+        save_interval=1000,
+        keep_period=8000,
         freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
         ema_decay=None,
     ),

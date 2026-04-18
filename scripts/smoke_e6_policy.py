@@ -23,7 +23,7 @@ def main() -> None:
     inp = e6_policy.E6Inputs(model_type=_model.ModelType.PI05)(ex)
     assert inp["state"].shape == (7,), inp["state"].shape
     assert inp["actions"].shape == (16, 7), inp["actions"].shape
-    assert sum(inp["image_mask"].values()) == 1
+    assert sum(inp["image_mask"].values()) == 2
 
     padded = transforms.PadStatesAndActions(32)(dict(inp))
     assert padded["state"].shape == (32,), padded["state"].shape
