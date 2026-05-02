@@ -95,6 +95,9 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            vision_lora_rank=getattr(config, "vision_lora_rank", None),
+            vision_lora_alpha=getattr(config, "vision_lora_alpha", 16.0),
+            vision_lora_layer_range=getattr(config, "vision_lora_layer_range", None),
         )
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)

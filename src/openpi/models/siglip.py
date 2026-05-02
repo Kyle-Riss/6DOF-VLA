@@ -12,7 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A refactored and simplified ViT adoptation for Pi, taken from big_vision."""
+"""A refactored and simplified ViT adoptation for Pi, taken from big_vision.
+
+Optional LoRA support
+---------------------
+``Encoder1DBlock`` / ``Encoder`` / ``_Module`` accept an optional
+``lora_config: openpi.models.lora.LoRAConfig`` plus an optional
+``lora_layer_range: tuple[int, int]`` (inclusive, 0-indexed) to restrict
+which encoder blocks actually contribute LoRA updates.
+
+The LoRA branch is added as a *parallel residual* to the existing MHA
+and MLP outputs (not by re-implementing those modules). Two pairs of
+low-rank matrices per block (``attn_lora_a/b`` and ``mlp_lora_a/b``)
+project the pre-residual block input through a rank-r bottleneck and
+add the result to the corresponding MHA / MLP output, scaled by
+``lora_config.scaling_value`` and a per-layer mask.
+
+The base ``nn.Dense`` / ``nn.MultiHeadDotProductAttention`` parameters
+are left untouched, so existing pretrained checkpoints continue to load
+without remapping. LoRA params are new and start from
+``lora_config.init_fn`` (default ``normal(stddev=0.01)``), which keeps
+the initial contribution very small. Layers outside ``lora_layer_range``
+receive a zero mask, so their LoRA params receive no gradient and stay
+at init values throughout training.
+"""
 
 from collections.abc import Sequence
 
@@ -21,6 +44,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+import openpi.models.lora as lora
 import openpi.training.sharding as sharding
 
 
@@ -72,35 +96,94 @@ class MlpBlock(nn.Module):
         return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
 
 
+def _lora_residual(
+    *,
+    pre_norm_input,
+    name_prefix: str,
+    lora_config: "lora.LoRAConfig",
+    layer_mask,
+    dtype_mm: str,
+    parent_module: nn.Module,
+):
+    """Compute a low-rank residual ``x · A · B`` and scale by mask + alpha/r.
+
+    LoRA params are created on ``parent_module`` (so they live alongside the
+    block they augment). ``layer_mask`` is multiplied into the result so
+    that layers outside the chosen range contribute nothing and get no
+    gradient flowing back to their LoRA params.
+    """
+    d = pre_norm_input.shape[-1]
+    rank = lora_config.rank
+    lora_a = parent_module.param(
+        f"{name_prefix}_lora_a",
+        lora_config.init_fn,
+        (d, rank),
+    )
+    lora_b = parent_module.param(
+        f"{name_prefix}_lora_b",
+        lora_config.init_fn,
+        (rank, d),
+    )
+    proj = jnp.einsum("BSD,DR->BSR", pre_norm_input, lora_a.astype(pre_norm_input.dtype))
+    out = jnp.einsum("BSR,RD->BSD", proj, lora_b.astype(pre_norm_input.dtype))
+    return out * (lora_config.scaling_value * layer_mask).astype(pre_norm_input.dtype)
+
+
 class Encoder1DBlock(nn.Module):
-    """Single transformer encoder block (MHSA + MLP)."""
+    """Single transformer encoder block (MHSA + MLP).
+
+    Optional LoRA: when ``lora_config`` is set, two parallel low-rank
+    residuals (one for MHA, one for MLP) are added to the block outputs,
+    scaled by ``layer_mask`` (0 disables for that layer).
+    """
 
     mlp_dim: int | None = None  # Defaults to 4x input dim
     num_heads: int = 12
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    lora_config: "lora.LoRAConfig | None" = None
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, layer_mask=1.0, deterministic=True):  # noqa: FBT002
         out = {}
         x = sharding.activation_sharding_constraint(x)
-        y = nn.LayerNorm(dtype=self.dtype_mm)(x)
+        # MHA branch
+        y_pre = nn.LayerNorm(dtype=self.dtype_mm)(x)
         y = out["sa"] = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             kernel_init=nn.initializers.xavier_uniform(),
             deterministic=deterministic,
             dtype=self.dtype_mm,
-        )(y, y)
+        )(y_pre, y_pre)
+        if self.lora_config is not None:
+            y = y + _lora_residual(
+                pre_norm_input=y_pre,
+                name_prefix="attn",
+                lora_config=self.lora_config,
+                layer_mask=layer_mask,
+                dtype_mm=self.dtype_mm,
+                parent_module=self,
+            )
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
         x = out["+sa"] = x + y
 
-        y = nn.LayerNorm(dtype=self.dtype_mm)(x)
+        # MLP branch
+        y_pre = nn.LayerNorm(dtype=self.dtype_mm)(x)
         y = out["mlp"] = MlpBlock(
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
-        )(y, deterministic)
+        )(y_pre, deterministic)
+        if self.lora_config is not None:
+            y = y + _lora_residual(
+                pre_norm_input=y_pre,
+                name_prefix="mlp",
+                lora_config=self.lora_config,
+                layer_mask=layer_mask,
+                dtype_mm=self.dtype_mm,
+                parent_module=self,
+            )
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
         x = out["+mlp"] = x + y
@@ -109,7 +192,14 @@ class Encoder1DBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Transformer Model Encoder for sequence to sequence translation."""
+    """Transformer Model Encoder for sequence to sequence translation.
+
+    Optional LoRA: pass ``lora_config`` to enable a parallel low-rank
+    residual on every encoder block. Use ``lora_layer_range=(start, end)``
+    (inclusive, 0-indexed) to restrict which blocks actually contribute —
+    layers outside the range receive a zero mask and their LoRA params
+    stay at init values (no gradient flow).
+    """
 
     depth: int
     mlp_dim: int | None = None  # Defaults to 4x input dim
@@ -118,23 +208,40 @@ class Encoder(nn.Module):
     scan: bool = False
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    lora_config: "lora.LoRAConfig | None" = None
+    lora_layer_range: tuple[int, int] | None = None
+
+    def _layer_mask(self) -> jnp.ndarray:
+        """Return a (depth,) float mask: 1.0 where LoRA contributes, else 0.0."""
+        if self.lora_config is None:
+            return jnp.zeros((self.depth,), dtype=jnp.float32)
+        if self.lora_layer_range is None:
+            return jnp.ones((self.depth,), dtype=jnp.float32)
+        start, end = self.lora_layer_range
+        return jnp.array(
+            [1.0 if start <= i <= end else 0.0 for i in range(self.depth)],
+            dtype=jnp.float32,
+        )
 
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
         out = {}
+        layer_mask = self._layer_mask()
 
         if self.scan:
             block = nn.remat(
                 Encoder1DBlock,
                 prevent_cse=False,
-                static_argnums=(2,),  # 0=self, 2=deterministic
+                static_argnums=(3,),  # 0=self, 1=x, 2=layer_mask, 3=deterministic
                 policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
             )
             x, scan_out = nn.scan(
                 block,
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
-                in_axes=nn.broadcast,
+                # layer_mask is scanned along axis 0 (per-layer scalar),
+                # deterministic is broadcast (same value for all layers).
+                in_axes=(0, nn.broadcast),
                 length=self.depth,
             )(
                 name="encoderblock",
@@ -142,7 +249,8 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
-            )(x, deterministic)
+                lora_config=self.lora_config,
+            )(x, layer_mask, deterministic)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
@@ -154,8 +262,9 @@ class Encoder(nn.Module):
                     mlp_dim=self.mlp_dim,
                     num_heads=self.num_heads,
                     dropout=self.dropout,
+                    lora_config=self.lora_config,
                 )
-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
+                x, out[f"block{lyr:02d}"] = block_cur(x, layer_mask[lyr], deterministic)
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
 
         return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
@@ -186,7 +295,11 @@ class MAPHead(nn.Module):
 
 
 class _Module(nn.Module):
-    """ViT model."""
+    """ViT model.
+
+    Optional LoRA: ``lora_config`` + ``lora_layer_range`` are forwarded to
+    :class:`Encoder`. See its docstring.
+    """
 
     num_classes: int | None = None
     patch_size: Sequence[int] = (16, 16)
@@ -203,6 +316,8 @@ class _Module(nn.Module):
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    lora_config: "lora.LoRAConfig | None" = None
+    lora_layer_range: tuple[int, int] | None = None
 
     @nn.compact
     def __call__(self, image, *, train=False):
@@ -246,6 +361,8 @@ class _Module(nn.Module):
             scan=self.scan,
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
+            lora_config=self.lora_config,
+            lora_layer_range=self.lora_layer_range,
             name="Transformer",
         )(x, deterministic=not train)
         encoded = out["encoded"] = x

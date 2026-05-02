@@ -50,9 +50,15 @@ class Config:
     num_kv_heads: int
     head_dim: int
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+    # Optional per-expert LoRA layer scoping. ``(start, end)`` inclusive,
+    # 0-indexed. Layers outside the range have their LoRA contribution
+    # multiplied by 0 (no forward effect, no gradient flow). When ``None``
+    # the LoRA is active on all layers (legacy behavior). Only meaningful
+    # when ``lora_configs`` is non-empty.
+    lora_layer_range: tuple[int, int] | None = None
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_300m_lora_r16", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -105,6 +111,16 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+        )
+    if variant == "gemma_300m_lora_r16":
+        return Config(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
     raise ValueError(f"Unknown variant: {variant}")
 
@@ -161,7 +177,11 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, attn_layer_masks=None):
+        # ``attn_layer_masks``: optional sequence of per-expert scalar masks
+        # (one entry per config). When provided, each expert's LoRA Einsum
+        # contribution is multiplied by its scalar — used by ``Module`` to
+        # restrict LoRA to specific layers via ``Config.lora_layer_range``.
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -173,6 +193,7 @@ class Attention(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
                 continue
+            mask_i = None if attn_layer_masks is None else attn_layer_masks[i]
             if config.num_kv_heads == config.num_heads:
                 qkv_einsum = lora.Einsum(
                     shape=(3, config.num_heads, config.width, config.head_dim),
@@ -180,7 +201,7 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
+                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x, layer_mask=mask_i))
             else:
                 q_einsum = lora.Einsum(
                     shape=(config.num_heads, config.width, config.head_dim),
@@ -188,14 +209,14 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                q = q_einsum("BTD,NDH->BTNH", x)
+                q = q_einsum("BTD,NDH->BTNH", x, layer_mask=mask_i)
                 kv_einsum = lora.Einsum(
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                k, v = kv_einsum("BSD,2KDH->2BSKH", x)
+                k, v = kv_einsum("BSD,2KDH->2BSKH", x, layer_mask=mask_i)
                 qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
@@ -235,13 +256,14 @@ class Attention(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 end = start + x.shape[1]
+                mask_i = None if attn_layer_masks is None else attn_layer_masks[i]
                 out_einsum = lora.Einsum(
                     shape=(config.num_heads, config.head_dim, config.width),
                     name=_name("attn_vec_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end], layer_mask=mask_i))
                 start = end
             else:
                 out.append(None)
@@ -290,7 +312,13 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, layer_masks, deterministic=True):  # noqa: FBT002
+        # ``layer_masks``: per-expert scalar mask for the current layer
+        # (shape ``(num_experts,)``). Sliced by ``Module``'s scan so each
+        # block sees one row. Multiplied into LoRA contributions inside
+        # ``Attention`` and ``lora.FeedForward`` to restrict LoRA to layers
+        # configured via ``Config.lora_layer_range``. Passing all-ones is
+        # equivalent to the legacy (no-mask) behavior.
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +333,9 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        # Pass per-expert layer mask scalars; Attention indexes ``[i]`` per expert.
+        attn_layer_masks = [layer_masks[i] for i in range(len(self.configs))]
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, attn_layer_masks=attn_layer_masks)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -321,7 +351,7 @@ class Block(nn.Module):
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
                     lora_config=config.lora_configs.get("ffn"),
-                )(x)
+                )(x, layer_mask=layer_masks[i])
             out.append(x)
             gates.append(gate if x is not None else None)
 
@@ -359,7 +389,10 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            # 0=self, 1=xs, 2=kv_cache, 3=positions, 4=attn_mask, 5=adarms_cond,
+            # 6=layer_masks, 7=deterministic. ``deterministic`` is the bool we
+            # need static; the others are arrays / pytrees.
+            static_argnums=(7,),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -371,8 +404,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
+                0,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=layer_masks (sliced per layer), 5=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -380,6 +414,28 @@ class Module(nn.Module):
             dropout_bdims=self.dropout_bdims,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
+
+    def _compute_layer_masks(self) -> jnp.ndarray:
+        """Build a ``(depth, num_experts)`` float mask.
+
+        Each column is one expert's per-layer mask: ``1.0`` where its LoRA
+        contributes, ``0.0`` outside its ``lora_layer_range``. Experts with
+        no ``lora_layer_range`` (or no LoRA at all) get an all-ones column,
+        matching the legacy unmasked behavior.
+        """
+        depth = self.configs[0].depth
+        cols = []
+        for cfg in self.configs:
+            if cfg.lora_layer_range is None:
+                col = jnp.ones((depth,), dtype=jnp.float32)
+            else:
+                start, end = cfg.lora_layer_range
+                col = jnp.array(
+                    [1.0 if start <= i <= end else 0.0 for i in range(depth)],
+                    dtype=jnp.float32,
+                )
+            cols.append(col)
+        return jnp.stack(cols, axis=1)  # shape (depth, num_experts)
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
@@ -402,7 +458,14 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        # Per-layer per-expert LoRA mask, shape (depth, num_experts). Sliced
+        # along axis 0 by the scan so each Block iteration sees one row of
+        # shape (num_experts,).
+        layer_masks = self._compute_layer_masks()
+
+        embedded, kv_cache = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, layer_masks, deterministic
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

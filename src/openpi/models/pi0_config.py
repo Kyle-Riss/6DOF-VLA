@@ -32,6 +32,30 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Optional LoRA on the SigLIP vision tower (separate from
+    # ``paligemma_variant`` which controls the Gemma LLM side). Set
+    # ``vision_lora_rank`` to a positive int to enable; layers outside
+    # ``vision_lora_layer_range`` (inclusive, 0-indexed) are masked out.
+    # The base SigLIP weights remain unchanged regardless — LoRA is added
+    # as a parallel residual.
+    vision_lora_rank: int | None = None
+    vision_lora_alpha: float = 16.0
+    vision_lora_layer_range: tuple[int, int] | None = None
+
+    # Optional LoRA layer scoping for the action expert (Gemma 300m, depth 18).
+    # Only meaningful when ``action_expert_variant`` already enables LoRA
+    # (e.g. ``"gemma_300m_lora"``). Inclusive 0-indexed range; layers outside
+    # have their LoRA contribution multiplied by 0 (no forward effect, no
+    # gradient flow). When ``None``, LoRA is active on all 18 layers (legacy
+    # v2/v3 behavior). Used by v4 to constrain which expert layers adapt.
+    action_expert_lora_layer_range: tuple[int, int] | None = None
+
+    # Per-dimension loss weights applied to the squared flow-matching error
+    # before averaging over action_dim. Length must equal action_dim (32).
+    # E.g. set index 3 to 3.0 to up-weight j4 during training (v7).
+    # When None, all dimensions are weighted equally (legacy behavior).
+    action_loss_weights: tuple[float, ...] | None = None
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -135,3 +159,50 @@ def freeze_filter_vlm_frozen_action_expert_lora_only() -> nnx.filterlib.Filter:
     expert_lora = nnx.All(has_lora, has_1)
     freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
     return nnx.Any(img, freeze_llm)
+
+
+def freeze_filter_v3_vision_late_lora() -> nnx.filterlib.Filter:
+    """Freeze base PaliGemma, train only (action-expert LoRA + vision LoRA + action heads).
+
+    Use with ``paligemma_variant="gemma_2b"``, ``action_expert_variant="gemma_300m_lora"``,
+    AND ``vision_lora_rank`` set on :class:`Pi0Config`.
+
+    Trainable:
+      - Action-expert LoRA tensors  (paths matching both ``lora`` and ``_1``)
+      - Vision LoRA tensors          (paths under ``PaliGemma/img/...`` containing ``lora``)
+      - Action-side heads outside ``PaliGemma`` (``action_in_proj``, ``time_mlp_*``, ``action_out_proj``)
+
+    Frozen:
+      - All LLM base weights (``PaliGemma/llm/...`` minus action-expert LoRA)
+      - All SigLIP base weights (``PaliGemma/img/...`` minus vision LoRA)
+
+    Note: layers excluded by ``vision_lora_layer_range`` still allocate LoRA params
+    (because :func:`scan` stacks them along the depth axis), but their contribution
+    is multiplied by a zero mask so they never influence the loss and never receive
+    gradient. They effectively stay at init values throughout training.
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    img = nnx_utils.PathRegex("PaliGemma/img/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    img_lora = nnx.All(img, has_lora)
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    freeze_img = nnx.All(img, nnx.Not(img_lora))
+    return nnx.Any(freeze_img, freeze_llm)
+
+
+def freeze_filter_v4_combined_lora() -> nnx.filterlib.Filter:
+    """Same gradient mask as v3: vision LoRA + action-expert LoRA + small action heads trainable.
+
+    v4 adds layer-range scoping on the action expert via
+    :attr:`Pi0Config.action_expert_lora_layer_range`, but that scoping happens
+    at forward time inside ``gemma.Module`` (via per-layer mask × LoRA output).
+    The freeze filter — which decides which params get a gradient slot in the
+    optimizer — does not need to change: out-of-range expert LoRA params are
+    still allocated, still listed as "trainable" by the filter, and the mask
+    zeroes their forward contribution so their gradient is exactly 0. This
+    function therefore delegates to :func:`freeze_filter_v3_vision_late_lora`
+    and is kept as an alias for clarity in v4 ``TrainConfig``s.
+    """
+    return freeze_filter_v3_vision_late_lora()
