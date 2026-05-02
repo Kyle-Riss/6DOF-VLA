@@ -10,6 +10,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
+import openpi.models.lora as _lora
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -67,8 +68,16 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self._action_loss_weights = config.action_loss_weights
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        # v4: optionally scope action-expert LoRA to a specific layer range
+        # (the Config dataclass is mutable; this only affects the freshly
+        # constructed instance returned by ``get_config``). Forward-time
+        # masking inside ``gemma.Module`` zeros out-of-range layer LoRA
+        # contributions, so gradient flow there is also exactly 0.
+        if config.action_expert_lora_layer_range is not None:
+            action_expert_config.lora_layer_range = config.action_expert_lora_layer_range
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -78,6 +87,18 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        # Optional LoRA on the SigLIP vision tower (v3+). When
+        # ``vision_lora_rank`` is None the model is identical to v2 (no LoRA
+        # on vision). When set, two pairs of low-rank residual matrices per
+        # encoder block are added in parallel to the existing MHA / MLP
+        # outputs; ``vision_lora_layer_range`` (inclusive, 0-indexed)
+        # restricts which encoder blocks contribute via a per-layer mask.
+        vision_lora_config: _lora.LoRAConfig | None = None
+        if config.vision_lora_rank is not None:
+            vision_lora_config = _lora.LoRAConfig(
+                rank=config.vision_lora_rank,
+                alpha=config.vision_lora_alpha,
+            )
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -85,6 +106,8 @@ class Pi0(_model.BaseModel):
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
+                lora_config=vision_lora_config,
+                lora_layer_range=config.vision_lora_layer_range,
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
@@ -211,7 +234,10 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        sq_err = jnp.square(v_t - u_t)
+        if self._action_loss_weights is not None:
+            sq_err = sq_err * jnp.array(self._action_loss_weights, dtype=sq_err.dtype)
+        return jnp.mean(sq_err, axis=-1)
 
     @override
     def sample_actions(

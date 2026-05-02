@@ -433,13 +433,35 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Union[SiglipVisionConfig, SiglipTextConfig]):
+    def __init__(self, config: Union[SiglipVisionConfig, SiglipTextConfig], layer_idx: Optional[int] = None):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.self_attn = SiglipAttention(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
+
+        # Optional parallel-residual LoRA (mirrors openpi/models/siglip.py:_lora_residual).
+        # Active only on layers within ``vision_lora_layer_range`` (inclusive, 0-indexed).
+        # For layers outside that range the JAX run uses mask=0; we skip the params here
+        # entirely so PyTorch state_dict only carries trained tensors.
+        self.has_attn_lora = False
+        self.has_mlp_lora = False
+        rank = getattr(config, "vision_lora_rank", None)
+        layer_range = getattr(config, "vision_lora_layer_range", None)
+        if rank and rank > 0 and layer_range is not None and layer_idx is not None:
+            lo, hi = layer_range
+            if lo <= layer_idx <= hi:
+                alpha = float(getattr(config, "vision_lora_alpha", float(rank)))
+                # JAX LoRAConfig.scaling_value = alpha / rank (rslora=False).
+                self.lora_scaling = alpha / rank
+                # JAX init_fn is normal(stddev=0.01) for both A and B.
+                self.attn_lora_a = nn.Parameter(torch.randn(self.embed_dim, rank) * 0.01)
+                self.attn_lora_b = nn.Parameter(torch.randn(rank, self.embed_dim) * 0.01)
+                self.mlp_lora_a = nn.Parameter(torch.randn(self.embed_dim, rank) * 0.01)
+                self.mlp_lora_b = nn.Parameter(torch.randn(rank, self.embed_dim) * 0.01)
+                self.has_attn_lora = True
+                self.has_mlp_lora = True
 
     def forward(
         self,
@@ -459,18 +481,30 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         """
         residual = hidden_states
 
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
+        ln1_out = self.layer_norm1(hidden_states)
+        attn_out, attn_weights = self.self_attn(
+            hidden_states=ln1_out,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
         )
-        hidden_states = residual + hidden_states
+        if self.has_attn_lora:
+            attn_lora = torch.matmul(
+                torch.matmul(ln1_out, self.attn_lora_a.to(ln1_out.dtype)),
+                self.attn_lora_b.to(ln1_out.dtype),
+            ) * self.lora_scaling
+            attn_out = attn_out + attn_lora
+        hidden_states = residual + attn_out
 
         residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        ln2_out = self.layer_norm2(hidden_states)
+        mlp_out = self.mlp(ln2_out)
+        if self.has_mlp_lora:
+            mlp_lora = torch.matmul(
+                torch.matmul(ln2_out, self.mlp_lora_a.to(ln2_out.dtype)),
+                self.mlp_lora_b.to(ln2_out.dtype),
+            ) * self.lora_scaling
+            mlp_out = mlp_out + mlp_lora
+        hidden_states = residual + mlp_out
 
         outputs = (hidden_states,)
 
@@ -558,7 +592,9 @@ class SiglipEncoder(nn.Module):
     def __init__(self, config: SiglipConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [SiglipEncoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        )
         self.gradient_checkpointing = False
 
     # Ignore copy

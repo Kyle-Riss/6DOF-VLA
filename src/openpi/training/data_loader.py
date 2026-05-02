@@ -265,6 +265,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        approach_oversample_factor=config.approach_oversample_factor,
     )
 
 
@@ -281,6 +282,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    approach_oversample_factor: float = 1.0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -299,13 +301,32 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    raw_dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = transform_dataset(raw_dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    # Build WeightedRandomSampler for approach-phase oversampling (v7+).
+    # Task strings containing "approach" get weight=approach_oversample_factor.
+    sampler = None
+    if approach_oversample_factor > 1.0 and data_config.repo_id not in (None, "fake"):
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+        lr_dataset = raw_dataset._dataset if isinstance(raw_dataset, TransformedDataset) else raw_dataset
+        task_indices = np.array(lr_dataset.hf_dataset["task_index"])
+        weights = np.ones(len(task_indices), dtype=np.float32)
+        for task_idx, task_str in dataset_meta.tasks.items():
+            if "approach" in task_str.lower():
+                weights[task_indices == task_idx] = approach_oversample_factor
+        n_approach = int((weights > 1.0).sum())
+        logging.info(f"Approach oversampling: {n_approach}/{len(weights)} frames weighted x{approach_oversample_factor}")
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.from_numpy(weights),
+            num_samples=len(weights),
+            replacement=True,
+        )
+        shuffle = False  # sampler handles randomization
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
-    sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(

@@ -52,7 +52,11 @@ class Einsum(nn.Module):
             self.w_b = self.param("lora_b", config.init_fn, shape_b)
 
     @nn.compact
-    def __call__(self, eqn: str, x):
+    def __call__(self, eqn: str, x, layer_mask=None):
+        # ``layer_mask``: optional scalar (or 0-d array). When set, multiplies the
+        # LoRA contribution; passing 0.0 zeroes that layer's contribution and
+        # blocks gradient flow to its LoRA params (used by gemma.Module's
+        # per-layer scoping). ``None`` is identical to the pre-mask behavior.
         dtype = x.dtype  # original dtype, could be half-precision
         result = jnp.einsum(eqn, x, self.w.astype(dtype))
 
@@ -60,7 +64,10 @@ class Einsum(nn.Module):
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
             lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
             lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
-            result = result + lora * config.scaling_value
+            lora_out = lora * config.scaling_value
+            if layer_mask is not None:
+                lora_out = lora_out * jnp.asarray(layer_mask).astype(dtype)
+            result = result + lora_out
 
         return result
 
@@ -121,12 +128,15 @@ class FeedForward(nn.Module):
             )
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, layer_mask=None):
+        # See ``Einsum.__call__`` for ``layer_mask`` semantics — same idea, applied
+        # to the three lora-augmented matmuls inside this feed-forward block.
         dtype = x.dtype  # original dtype, could be half-precision
         ff_gate = self._dot(
             x,
             self.w_gating[0],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+            layer_mask=layer_mask,
         )
         gate_value = nn.gelu(ff_gate)
 
@@ -134,15 +144,25 @@ class FeedForward(nn.Module):
             x,
             self.w_gating[1],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+            layer_mask=layer_mask,
         )
         activations = gate_value * ff1
 
-        outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
+        outputs = self._dot(activations, self.w_linear, self.w_linear_lora, layer_mask=layer_mask)
         assert outputs.dtype == dtype
         return outputs
 
-    def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None) -> at.Array:
+    def _dot(
+        self,
+        x: at.Array,
+        w: at.Array,
+        lora_weights: tuple[at.Array, at.Array] | None,
+        layer_mask=None,
+    ) -> at.Array:
         base = jnp.dot(x, w.astype(x.dtype))
         if lora_weights is None:
             return base
-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        lora_out = jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        if layer_mask is not None:
+            lora_out = lora_out * jnp.asarray(layer_mask).astype(x.dtype)
+        return base + lora_out

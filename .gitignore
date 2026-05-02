@@ -4,6 +4,11 @@ checkpoints/
 data/
 wandb/
 
+# AI agent per-developer memory (rules are shared, progress is personal)
+.cursor/memory/
+.claude/
+.codex/local/
+
 # Large / local-only artifacts (weights live under checkpoints/ or separate storage)
 **/*.safetensors
 *.pid

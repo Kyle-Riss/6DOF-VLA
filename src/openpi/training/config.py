@@ -564,6 +564,11 @@ class TrainConfig:
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
+    # If set > 1.0, frames whose task string contains "approach" are sampled at
+    # this multiple of the base rate (WeightedRandomSampler with replacement).
+    # Only effective for LeRobot datasets with per-frame task labels (e.g. v6+).
+    approach_oversample_factor: float = 1.0
+
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
@@ -1006,6 +1011,360 @@ _CONFIGS = [
         save_interval=1000,
         keep_period=8000,
         freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # E6 v2: same 7D state/action contract as v1 (j1..j6 + gripper_tooldo1) but
+        # collected at 16Hz with images already 224x224 and a single episode-level prompt.
+        # Strictly separate dataset from v1 — do not mix.
+        name="pi05_e6_v2_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="kyle-riss/dobot_e6_pick_place_orange_v2",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v2",
+                asset_id="kyle-riss/dobot_e6_pick_place_orange_v2",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # 80k step ≈ 5 epoch @ batch=8 (v1 32k≈5 epoch과 매칭). 데이터 frame 2.5배라 step도 늘림.
+        # CosineDecaySchedule.decay_steps default(30k)가 num_train_steps에 자동 추종 안 하므로 명시 필수.
+        num_train_steps=80_000,
+        batch_size=8,
+        log_interval=50,
+        # save 5k 단위, 영구 보존 20k 단위 (20k/40k/60k/80k = 4개, ~25GB).
+        save_interval=5000,
+        keep_period=20_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=80_000),
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # E6 v3: identical contract to v2 (same dataset / fps / image / state-action contract),
+        # but adds parallel-residual LoRA on the SigLIP vision tower's last 5 encoder blocks
+        # (0-indexed 22..26 of 27 in So400m/14). Hypothesis: v2 left vision frozen so the model
+        # could not learn to detect the "approach phase" visually, leaving j4 wrist-pitch
+        # under-pushed at inference. v3 only changes vision LoRA — action expert is identical
+        # to v2 (full 18-layer rank=32 LoRA via ``gemma_300m_lora``) so the comparison is
+        # single-variable.
+        name="pi05_e6_v3_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            # Vision LoRA — last 5 SigLIP encoder blocks. So400m has 27 layers (depth=27),
+            # so 0-indexed inclusive range (22, 26) = layers 23..27 in 1-indexed terms.
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="kyle-riss/dobot_e6_pick_place_orange_v2",  # v2 dataset reused as-is
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                # Separate v3 assets dir to keep stats isolated from v1/v2.
+                assets_dir="assets/pi05_e6_v3",
+                asset_id="kyle-riss/dobot_e6_pick_place_orange_v2",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # 30k step ≈ post-plateau cutoff (v2 loss plateaued ~10k; 80k showed minor returns).
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        # Save 2k / keep 10k → permanent 10k/20k/30k (3 ckpts, ~16GB at v2 sizes).
+        save_interval=2000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        # NB: must use the v3-specific freeze filter — the v2 filter freezes ALL of
+        # ``PaliGemma/img/*`` which would also freeze the new vision LoRA params.
+        freeze_filter=pi0_config.freeze_filter_v3_vision_late_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # E6 v4 — vision LoRA last 5 (same as v3) + action-expert LoRA scoped to
+        # middle-late layers 12-16 (0-indexed 11..15) of 18. v3 (vision-only) and a
+        # separate action-only run (12-16 alone) both produced the same trajectory-up
+        # symptom, so v4 tests whether the *combination* (interaction effect) shifts
+        # behavior. Action expert variant remains ``gemma_300m_lora`` (rank 32) but
+        # forward-time per-layer mask zeros the LoRA contribution outside (11, 15),
+        # so out-of-range layers receive no gradient and stay at LoRA init values.
+        # The freeze filter is identical to v3 — layer scoping is at forward time.
+        name="pi05_e6_v4_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            # Vision LoRA — last 5 SigLIP encoder blocks (depth=27 → 0-indexed (22, 26)).
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            # Action expert LoRA — middle-late 5 of 18 layers, 0-indexed inclusive.
+            # i.e. layers 12-16 in 1-indexed terms.
+            action_expert_lora_layer_range=(11, 15),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="kyle-riss/dobot_e6_pick_place_orange_v2",  # v2 dataset reused as-is
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                # Separate v4 assets dir to keep stats isolated from v1/v2/v3.
+                assets_dir="assets/pi05_e6_v4",
+                asset_id="kyle-riss/dobot_e6_pick_place_orange_v2",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # E6 v5 — vision LoRA last 5 (same as v3/v4) + action-expert LoRA scoped to
+        # the last 3 of 18 layers (0-indexed (15, 17)) at rank 16. v4 keeps action
+        # at rank 32 over middle-late layers (11, 15); v5 narrows both the layer
+        # window (last 3 instead of middle-late 5) and the capacity (rank 16
+        # instead of 32) to test whether the smaller, later-layer LoRA produces a
+        # cleaner j4 wrist signal. Vision side is identical to v3/v4 to isolate
+        # the action-side variable. Uses the v4 freeze filter unchanged because
+        # action-expert LoRA params are gated at forward time by the per-layer
+        # mask, not by the freeze filter.
+        name="pi05_e6_v5_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            # Vision LoRA — last 5 SigLIP encoder blocks (0-indexed (22, 26)).
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            # Action expert LoRA — last 3 of 18 layers, 0-indexed inclusive.
+            # i.e. layers 16-18 in 1-indexed terms.
+            action_expert_lora_layer_range=(15, 17),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="kyle-riss/dobot_e6_pick_place_orange_v2",  # v2 dataset reused as-is
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                # Separate v5 assets dir to keep stats isolated from v1/v2/v3/v4.
+                assets_dir="assets/pi05_e6_v5",
+                asset_id="kyle-riss/dobot_e6_pick_place_orange_v2",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # E6 v6 — back-to-basics data fix. Root-cause analysis after v1~v5 all failed
+        # (hovering/oscillating, j4 not reaching -28°): idle frame contamination (32%),
+        # episode-level prompt (no phase signal), and absolute-position action (OOD robot +
+        # high starting-pose variance). v6 fixes data only; LoRA scope = v2 (no changes).
+        #
+        # Data changes vs v2:
+        #   1. Velocity action: action[t] = state[t+1] - state[t]  (deg/frame, 7D)
+        #   2. Idle filtering: consecutive ≥5-frame idle runs removed, last 15 frames trimmed
+        #   3. Per-frame phase prompt: approach/grasp/transport/place/release based on z+gripper
+        #
+        # ⚠️ Inference contract changed: run_e6_client.py must INTEGRATE velocity to get
+        # absolute targets. Do NOT deploy with v2-style inference. (Change deferred.)
+        #
+        # Dataset: Kyle-Riss/dobot_e6_pick_place_orange_v6
+        # Script:  examples/e6/convert_e6_v6_to_lerobot.py
+        name="pi05_e6_v6_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            # No vision LoRA — single-variable test: data quality only.
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v6",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v6_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v6",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=20_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=80_000),
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v7: approach oversampling 3x + j4 loss weight 3x
+    #
+    # Built on v6 dataset (velocity actions, idle-filtered, per-frame phase prompts).
+    # Two changes vs v6:
+    #   1. approach frames sampled 3x more often (WeightedRandomSampler)
+    #   2. j4 (index 3) squared-error weighted 3x before loss mean
+    #
+    # Reuses v6 norm_stats (same dataset, same normalization).
+    # ⚠️ norm_stats gripper patch (q01[6]=-1, q99[6]=1) must already be applied.
+    #
+    TrainConfig(
+        name="pi05_e6_v7_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            # j4 is index 3. Up-weight 3x to push descent learning.
+            action_loss_weights=(1.0, 1.0, 1.0, 3.0, 1.0, 1.0, 1.0) + (1.0,) * 25,
+        ),
+        approach_oversample_factor=3.0,
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v6",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v6_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v6",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=20_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=80_000),
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v8: clean 533ep + velocity action + idle filter + phase prompt (lift fix) + vision LoRA last5 + action 18L
+    #
+    # First properly-conditioned experiment:
+    #   - No data contamination (ep272~399 issue eliminated)
+    #   - Vision SigLIP LoRA (0-idx 22-26, rank16) for OOD camera adaptation
+    #   - Action expert full 18 layers rank32
+    #   - v6 preprocessing: velocity delta, idle filter, per-frame phase prompt, lift/place fix
+    #
+    TrainConfig(
+        name="pi05_e6_v8_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v8",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v8_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v8",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=25_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=50_000),
+        freeze_filter=pi0_config.freeze_filter_v3_vision_late_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v9: same as v8 but action expert scoped to middle-late layers 12-16 (0-idx 11-15)
+    # Run if v8 shows signs of over-adaptation or instability.
+    #
+    TrainConfig(
+        name="pi05_e6_v9_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=(11, 15),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v8",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v8_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v8",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=25_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=50_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),
     #
