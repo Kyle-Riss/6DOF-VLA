@@ -15,6 +15,16 @@ wandb/
 preview_e6_*/
 .pytest_cache_openpi/
 
+# Local-only data / scratch
+.venv-fiftyone/
+2CAM.zip
+droid_100/
+droid_100_fo_preview/
+preview_compare/
+preview_v13/
+preview_droid_100_fiftyone.py
+nohup.out
+
 # JAX
 .jax_cache/
 

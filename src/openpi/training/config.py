@@ -91,6 +91,12 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional per-step language augmentation: maps anchor task_index → tuple of variant indices.
+    # When provided, the stored task_index is treated as a group key and a variant is chosen
+    # at random each training step (mirrors DROID's 3-instruction random selection).
+    # Example for v13: {0: (0, 1, 2), 3: (3, 4, 5)}
+    task_group_map: dict[int, tuple[int, ...]] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -467,6 +473,9 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class LeRobotE6DataConfig(DataConfigFactory):
     """Data config for a custom E6 LeRobot dataset."""
 
+    # v14+: align state/action to DROID 8D format (gripper at index 7).
+    align_droid_state: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -483,10 +492,9 @@ class LeRobotE6DataConfig(DataConfigFactory):
                 )
             ]
         )
-        # E6 v1 uses 6 joint deltas + 1 gripper command directly in the dataset actions.
         data_transforms = _transforms.Group(
-            inputs=[e6_policy.E6Inputs(model_type=model_config.model_type)],
-            outputs=[e6_policy.E6Outputs()],
+            inputs=[e6_policy.E6Inputs(model_type=model_config.model_type, align_droid_state=self.align_droid_state)],
+            outputs=[e6_policy.E6Outputs(align_droid_state=self.align_droid_state)],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -1364,6 +1372,698 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=25_000,
         lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=50_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v10: v10 dataset (192 eps, standardized start j3=53.8°, faster demos, IK-flip excluded)
+    #   - Same LoRA scope as v8: action expert all 18 layers rank=32 + vision SigLIP 0-idx 22-26 rank=16
+    #   - approach oversample 3x (approach ~15% of frames)
+    #
+    TrainConfig(
+        name="pi05_e6_v10_lora",
+        approach_oversample_factor=1.0,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v10_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=25_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=50_000),
+        freeze_filter=pi0_config.freeze_filter_v3_vision_late_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v11: same v10 dataset, action expert scoped to middle-late layers 12-16 (0-idx 11-15)
+    #   Mirror of v9 vs v8: tests whether narrower action scope helps on v10 data.
+    #
+    TrainConfig(
+        name="pi05_e6_v11_lora",
+        approach_oversample_factor=1.0,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=(11, 15),
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v10_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v12: same v10 dataset, rank=16 full 18 layers
+    #   Ablation: rank=16 with full scope (between v10 rank=32/full and v11 rank=16/11~15)
+    #   Tests whether rank reduction alone (without scope restriction) reduces overfitting.
+    #
+    TrainConfig(
+        name="pi05_e6_v12_lora",
+        approach_oversample_factor=1.0,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v10_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v10",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v3_vision_late_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v13: episode-level prompt × 3 variants (DROID format), bi-directional dataset (~850 sub-eps).
+    #   - Same LoRA scope as v11: vision SigLIP 22-26 rank=16 + action expert 11-15 rank=16
+    #   - wrist_image_keys=() so ZED (left_wrist_0_rgb) also receives spatial augmentation
+    #   - Dataset: Kyle-Riss/dobot_e6_pick_place_orange_v13 (2CAM-Orange + init + Opposite)
+    #
+    TrainConfig(
+        name="pi05_e6_v13_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=(11, 15),
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v13",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v13_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v13",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v14: 8D DROID-aligned state, 18L full action expert LoRA, full episode format.
+    #   - align_droid_state=True: gripper at index 7 (matches pi05_base Franka 8D layout)
+    #   - action_expert_lora_layer_range=None: all 18 layers active
+    #   - vision LoRA 22-26 r16 (same as v13)
+    #   - Dataset: Kyle-Riss/dobot_e6_pick_place_orange_v14
+    #
+    TrainConfig(
+        name="pi05_e6_v14_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            align_droid_state=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+                task_group_map={0: (0, 1, 2), 3: (3, 4, 5)},
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v14_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v15: E6-native 7D state, no dummy joint, same data/architecture as v14.
+    #   - align_droid_state=False: native [j1..j6, gripper] 7D (no DROID alignment)
+    #   - action_expert_lora_layer_range=None: all 18 layers active
+    #   - vision LoRA 22-26 r16 (same as v14)
+    #   - Dataset: Kyle-Riss/dobot_e6_pick_place_orange_v14 (reused, stored as 7D)
+    #
+    TrainConfig(
+        name="pi05_e6_v15_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+                task_group_map={0: (0, 1, 2), 3: (3, 4, 5)},
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v15_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v14",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v16: absolute gripper action + per-frame phase-aligned language prompts.
+    #   - action[6] = gripper ABSOLUTE (0.0 or 1.0), NOT delta.
+    #     Fixes oscillation from sparse delta {-1,0,+1} at inference time.
+    #     Executor: suction_cmd = 1 if action[6] > 0.5 else 0  (no accumulation)
+    #   - 12-task phase vocabulary (6 phases × 2 directions), assigned per frame.
+    #     No task_group_map — each frame keeps its phase-specific task string.
+    #   - Same architecture as v15 (vision LoRA 22-26 r16, 18L action expert r16).
+    #   - Dataset: Kyle-Riss/dobot_e6_pick_place_orange_v16 (new conversion)
+    #
+    TrainConfig(
+        name="pi05_e6_v16_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v16_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E6 v17: vision LoRA 14~25 (layer 26 제거) + absolute gripper + 6-phase frame prompt.
+    #   - vision_lora_layer_range: (22, 26) → (14, 25)
+    #     근거: SigLIP 22~26은 sigmoid contrastive loss 최종 타깃(텍스트 정렬 편향 최대).
+    #     Layer 26은 공간 정보를 가장 강하게 압축 → 조작 태스크에 detrimental.
+    #     Layer 14~18 = SigLIP attention focus zone (오브젝트 공간 관계, part-level).
+    #     Layer 19~25 = 고수준 의미, OOD 카메라 뷰 적응.
+    #     6-phase frame prompt가 semantic을 담당하므로 vision은 공간 정보에 집중.
+    #     (참고: project_e6_siglip_lora_design.md)
+    #   - 그 외 모든 설정은 v16과 동일 (dataset, action semantics, action expert).
+    #
+    TrainConfig(
+        name="pi05_e6_v17_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(14, 25),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=15_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v18: vision LoRA full (0~25, 26L) — ablation baseline upper bound
+    TrainConfig(
+        name="pi05_e6_v18_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(0, 25),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v19: vision LoRA mid only (14~18, 5L) — focus zone isolation
+    TrainConfig(
+        name="pi05_e6_v19_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(14, 18),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v20: vision LoRA high only (19~25, 7L) — high-level semantic layers
+    TrainConfig(
+        name="pi05_e6_v20_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(19, 25),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v21: vision LoRA low only (0~8, 9L) — low-level texture/edge layers
+    TrainConfig(
+        name="pi05_e6_v21_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(0, 8),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v22: vision LoRA Mid 전체 (9~17, 9L) — 구조적 특징 구간 단독
+    TrainConfig(
+        name="pi05_e6_v22_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(9, 17),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v23: vision LoRA Late 전체 (18~26, 9L) — 고수준 의미+공간 구간 단독 (26 포함, v20과 1:1 비교)
+    TrainConfig(
+        name="pi05_e6_v23_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v25: vision LoRA (15~19, 5L) — Mid/Late 경계 구간 (v19 14~18과 1칸 shift 비교)
+    TrainConfig(
+        name="pi05_e6_v25_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(15, 19),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v26: vision LoRA (22~25, 4L) — Late 상위 26 제외 (v16 계열 22~26 대비 26 편향 제거 효과 확인)
+    TrainConfig(
+        name="pi05_e6_v26_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(22, 25),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    # v24: vision LoRA full (0~26, 27L) — layer 26까지 포함한 완전 LoRA (v18은 0~25)
+    TrainConfig(
+        name="pi05_e6_v24_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(0, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v17_lora",
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
         freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),

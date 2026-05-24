@@ -1,0 +1,20 @@
+---
+description: Global Project Rules and Memory Sync for 6DOF-VLA E6
+globs: **/*
+---
+
+# AI 행동 지침
+
+## 작업 시작 전 필수
+1. 루트의 `CLAUDE.md`를 읽어 프로젝트 핵심 규칙 파악
+2. `.cursor/memory/progress.md`를 읽어 현재 진행 상황 파악
+3. 관련 이슈가 있으면 `.cursor/memory/decisions.md` 확인
+
+## Action Semantics 경고
+E6 action은 **절대 위치(degree)**, delta 아님. 코드에서 `current + action` 패턴이 보이면 즉시 버그로 간주하고 보고.
+
+## 작업 완료 후
+사용자에게 `.cursor/memory/progress.md` 업데이트를 제안할 것.
+
+## 이 프로젝트의 진실의 근원(Source of Truth)
+루트 `CLAUDE.md` > `.cursor/memory/` > 코드 주석 순서로 신뢰.

@@ -30,6 +30,10 @@ def _parse_image(image) -> np.ndarray:
 class E6Inputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
+    # Align state/action to DROID 8D format: insert dummy j7=0 at index 6 so
+    # gripper lands at index 7, matching pi05_base pretraining (Franka 7-DOF).
+    # v14+ only; set False to preserve v1-v13 behaviour.
+    align_droid_state: bool = False
 
     def __call__(self, data: dict) -> dict:
         hik_image = _parse_image(data["observation/exterior_image_1_left"])
@@ -48,14 +52,25 @@ class E6Inputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
+        raw_state = np.asarray(data["observation/state"])  # (7,)
+        if self.align_droid_state:
+            # [j1..j6, gripper] → [j1..j6, 0, gripper]: gripper at index 7 = DROID format
+            state = np.insert(raw_state, 6, 0.0)  # (8,)
+        else:
+            state = raw_state
+
         inputs = {
-            "state": np.asarray(data["observation/state"]),
+            "state": state,
             "image": dict(zip(names, images, strict=True)),
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
 
         if "actions" in data:
-            inputs["actions"] = np.asarray(data["actions"])
+            acts = np.asarray(data["actions"])
+            if self.align_droid_state:
+                # [Δj1..Δj6, Δgripper] → [Δj1..Δj6, 0, Δgripper]
+                acts = np.insert(acts, 6, 0.0, axis=-1)  # (..., 8)
+            inputs["actions"] = acts
 
         if "prompt" in data:
             if isinstance(data["prompt"], bytes):
@@ -67,6 +82,13 @@ class E6Inputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class E6Outputs(transforms.DataTransformFn):
+    # Must match E6Inputs.align_droid_state for the same training run.
+    align_droid_state: bool = False
+
     def __call__(self, data: dict) -> dict:
-        # E6 external action contract is 7D: 6 joints + 1 gripper.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        acts = np.asarray(data["actions"])
+        if self.align_droid_state:
+            # Model outputs at index 7 = Δgripper; skip dummy j7 at index 6.
+            return {"actions": np.concatenate([acts[:, :6], acts[:, 7:8]], axis=-1)}
+        # Legacy 7D: first 7 dims = [Δj1..Δj6, Δgripper].
+        return {"actions": acts[:, :7]}

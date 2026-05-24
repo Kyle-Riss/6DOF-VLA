@@ -56,6 +56,12 @@ class Pi0Config(_model.BaseModelConfig):
     # When None, all dimensions are weighted equally (legacy behavior).
     action_loss_weights: tuple[float, ...] | None = None
 
+    # Keys that receive ONLY color augmentation (no spatial crop/rotate) during training.
+    # When None (default), any key containing "wrist" is treated as wrist-only.
+    # Set to () so that ALL camera slots receive spatial augmentation — correct for E6
+    # where both base_0_rgb (HIK) and left_wrist_0_rgb (ZED) are exterior cameras.
+    wrist_image_keys: tuple[str, ...] | None = None
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -206,3 +212,24 @@ def freeze_filter_v4_combined_lora() -> nnx.filterlib.Filter:
     and is kept as an alias for clarity in v4 ``TrainConfig``s.
     """
     return freeze_filter_v3_vision_late_lora()
+
+
+def freeze_filter_vision_full_finetune() -> nnx.filterlib.Filter:
+    """Full SigLIP fine-tuning: freeze only LLM base weights, everything else trainable.
+
+    Trainable:
+      - All SigLIP (PaliGemma/img) base weights — no LoRA, direct weight update
+      - Action-expert LoRA tensors (paths matching both ``lora`` and ``_1``)
+      - Action-side heads (``action_in_proj``, ``time_mlp_*``, ``action_out_proj``)
+
+    Frozen:
+      - All LLM base weights (``PaliGemma/llm/...`` minus action-expert LoRA)
+
+    Use with ``vision_lora_rank=None`` (no LoRA adapters on SigLIP).
+    """
+    llm = nnx_utils.PathRegex("PaliGemma/llm/.*")
+    has_lora = nnx_utils.PathRegex(".*lora.*")
+    has_1 = nnx_utils.PathRegex(".*_1.*")
+    expert_lora = nnx.All(has_lora, has_1)
+    freeze_llm = nnx.All(llm, nnx.Not(expert_lora))
+    return freeze_llm

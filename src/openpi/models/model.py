@@ -148,9 +148,15 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    wrist_image_keys: frozenset[str] | None = None,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    wrist_image_keys: when provided, only these keys skip spatial augmentation (crop/rotate).
+        When None (default), any key containing "wrist" is treated as a wrist camera.
+        Pass frozenset() to apply spatial augmentation to all cameras (e.g. E6 where both
+        slots hold exterior cameras).
     """
 
     if not set(image_keys).issubset(observation.images):
@@ -170,7 +176,8 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            is_wrist = key in wrist_image_keys if wrist_image_keys is not None else "wrist" in key
+            if not is_wrist:
                 height, width = image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),

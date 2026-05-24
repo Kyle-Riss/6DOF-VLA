@@ -308,16 +308,33 @@ class ExtractFASTActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PromptFromLeRobotTask(DataTransformFn):
-    """Extracts a prompt from the current LeRobot dataset task."""
+    """Extracts a prompt from the current LeRobot dataset task.
+
+    When task_group_map is provided, the stored task_index is treated as a group
+    key and one member is chosen at random each training step — matching DROID's
+    per-step language augmentation.  Example:
+        task_group_map={0: [0, 1, 2], 3: [3, 4, 5]}
+    means task_index 0 (left→right anchor) randomly resolves to task 0, 1, or 2
+    each time the sample is drawn, and task_index 3 (right→left anchor) resolves
+    to task 3, 4, or 5.  For datasets without groups, leave as None (default).
+    """
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     tasks: dict[int, str]
+    # Optional direction→variant group map for per-step language augmentation.
+    task_group_map: dict[int, tuple[int, ...]] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
+        import random
+
         if "task_index" not in data:
             raise ValueError('Cannot extract prompt without "task_index"')
 
         task_index = int(data["task_index"])
+
+        if self.task_group_map is not None and task_index in self.task_group_map:
+            task_index = random.choice(self.task_group_map[task_index])
+
         if (prompt := self.tasks.get(task_index)) is None:
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 

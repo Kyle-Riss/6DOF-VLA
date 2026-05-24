@@ -146,7 +146,10 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(
+            dataset,
+            [_transforms.PromptFromLeRobotTask(dataset_meta.tasks, task_group_map=data_config.task_group_map)],
+        )
 
     return dataset
 

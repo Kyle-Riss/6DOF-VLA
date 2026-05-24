@@ -1,13 +1,13 @@
 """
-Convert Dobot Magician E6 v8 raw episode folders to LeRobot format for pi05_e6_v8_lora.
+Convert Dobot Magician E6 v10 raw episode folders to LeRobot format for pi05_e6_v10_lora.
 
-v8 changes vs v6:
-* Clean dataset (534 eps, no j1-inversion contamination).
-* Phase classification fix: lift/place_descent are now distinguished via crossed_lift flag.
-  v6 incorrectly labelled post-grasp ascent (lift) as "place" because both share
-  gripper=1 + z≤Z_LIFT. Now tracked by whether z has crossed Z_LIFT after grasp.
-* ep285 excluded (14Hz, low frame rate).
-* New HF repo: Kyle-Riss/dobot_e6_pick_place_orange_v8
+v10 changes vs v8:
+* Standardized start pose: j3=53.8°, j4=-1.5° for all episodes.
+* A/B section separation: A section j3 decreases during approach, B increases.
+* Faster demo speed: approach dj3 ~0.4-1.0°/f (vs 0.27 in v8).
+* Excluded episodes: {16, 97, 98, 129, 149, 150} mode=9 (IK flip), {193} failed episode.
+* Source: /media/billy/새 볼륨/Dobot/2CAM-Orange-init (199 raw, 192 valid)
+* New HF repo: Kyle-Riss/dobot_e6_pick_place_orange_v10
 
 Phase classification (per frame):
   approach  — gripper=0, before grasp
@@ -58,7 +58,7 @@ import tyro
 from lerobot.common.constants import HF_LEROBOT_HOME
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-DEFAULT_REPO_ID = "Kyle-Riss/dobot_e6_pick_place_orange_v8"
+DEFAULT_REPO_ID = "Kyle-Riss/dobot_e6_pick_place_orange_v10"
 
 JOINT_COLS = ("j1", "j2", "j3", "j4", "j5", "j6")
 GRIPPER_COL = "gripper_tooldo1"
@@ -254,7 +254,7 @@ def main(
     repo_id: str = DEFAULT_REPO_ID,
     root: Path | None = None,
     episode_dir: list[Path] | None = None,
-    exclude: tuple[int, ...] = (285,),  # ep285: 14Hz low frame rate
+    exclude: tuple[int, ...] = (16, 97, 98, 129, 149, 150, 193),  # mode=9 or failed
     csv_name: str = "robot_data.csv",
     images_subdir: str = "images",
     fps: int = 16,
@@ -263,10 +263,10 @@ def main(
     clean: bool = True,
     push_to_hub: bool = False,
     hub_private: bool = False,
-    image_writer_threads: int = 4,
+    image_writer_threads: int = 0,
     image_writer_processes: int = 0,
 ) -> None:
-    """Convert v8 raw episodes into LeRobot dataset (velocity + idle filter + lift/place fix)."""
+    """Convert v10 raw episodes into LeRobot dataset (velocity + idle filter + lift/place fix)."""
     episode_paths = _resolve_episodes(episode_dir, root, exclude)
 
     output_root = HF_LEROBOT_HOME / repo_id
