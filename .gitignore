@@ -8,6 +8,8 @@ wandb/
 .cursor/memory/
 .claude/
 .codex/local/
+CLAUDE.md
+AGENTS.md
 
 # Large / local-only artifacts (weights live under checkpoints/ or separate storage)
 **/*.safetensors
