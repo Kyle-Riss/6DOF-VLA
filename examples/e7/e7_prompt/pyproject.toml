@@ -1,0 +1,13 @@
+[project]
+name = "e7-prompt"
+version = "1.1.0"
+description = "Shared prompt contract for the E7 (xArm6) VLA — one renderer for training and inference"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["e7_prompt"]
