@@ -186,6 +186,7 @@ def convert_pi0_checkpoint_with_lora_merge(
     precision: str,
     output_path: str,
     model_config: openpi.models.pi0_config.Pi0Config,
+    config_name: str = "",
 ):
     print(f"=== Convert (LoRA-merged): {checkpoint_dir}  ->  {output_path} ===")
     print(f"Model config: {model_config}")
@@ -263,11 +264,28 @@ def convert_pi0_checkpoint_with_lora_merge(
     else:
         print(f"WARNING: no assets dir at {assets_source}")
 
+    # Everything the deployment side needs to rebuild an identical model. The
+    # fields below are NOT cosmetic: ``image_keys`` decides how many camera slots
+    # the sequence has (a 2-slot checkpoint fed through the 3-slot default silently
+    # produces a different token layout), and ``vision_lora_*`` must match or the
+    # extracted per-layer LoRA tensors have nowhere to load into. ``config_name`` is
+    # recorded so the executor can resolve the same TrainConfig rather than
+    # reconstructing one by hand.
     config_dict = {
+        "config_name": config_name,
         "action_dim": model_config.action_dim,
         "action_horizon": model_config.action_horizon,
+        "max_token_len": model_config.max_token_len,
+        "pi05": model_config.pi05,
         "paligemma_variant": model_config.paligemma_variant,
         "action_expert_variant": model_config.action_expert_variant,
+        "image_keys": list(model_config.image_keys),
+        "vision_lora_rank": model_config.vision_lora_rank,
+        "vision_lora_alpha": model_config.vision_lora_alpha,
+        "vision_lora_layer_range": list(model_config.vision_lora_layer_range)
+        if model_config.vision_lora_layer_range else None,
+        "action_expert_lora_layer_range": list(model_config.action_expert_lora_layer_range)
+        if model_config.action_expert_lora_layer_range else None,
         "precision": precision,
         "lora_merged": True,
     }
@@ -286,7 +304,7 @@ def main(
     model_config = _config.get_config(config_name).model
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
         raise ValueError(f"Config {config_name} is not a Pi0Config")
-    convert_pi0_checkpoint_with_lora_merge(checkpoint_dir, precision, output_path, model_config)
+    convert_pi0_checkpoint_with_lora_merge(checkpoint_dir, precision, output_path, model_config, config_name)
 
 
 if __name__ == "__main__":

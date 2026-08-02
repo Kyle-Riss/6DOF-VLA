@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.e6_policy as e6_policy
+import openpi.policies.e7_policy as e7_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -495,6 +496,50 @@ class LeRobotE6DataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[e6_policy.E6Inputs(model_type=model_config.model_type, align_droid_state=self.align_droid_state)],
             outputs=[e6_policy.E6Outputs(align_droid_state=self.align_droid_state)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotE7DataConfig(DataConfigFactory):
+    """Data config for xArm 6 (E7) LeRobot dataset.
+
+    State/action are 7D: [j1..j6, gripper] — identical in shape and semantics to
+    E6, so the same LeRobot schema and conversion contract apply:
+        state  = [j1..j6 (t), gripper_command (t)]        degrees, absolute
+        action = [Δj1..Δj6 (t→t+1), gripper_command (t+1)] deg/frame, gripper absolute
+
+    Deliberately NO DROID 8D alignment (no dummy j7, gripper stays at index 6):
+    E6 v23 — the reference run for the E6→E7 cross-embodiment comparison — used
+    ``align_droid_state=False``, and the padded dims cost ~1% of the loss anyway
+    (measured on v23), so there is nothing to gain from realigning here.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        "observation/state": "state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[e7_policy.E7Inputs(model_type=model_config.model_type)],
+            outputs=[e7_policy.E7Outputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -2064,6 +2109,270 @@ _CONFIGS = [
         save_interval=2500,
         keep_period=10_000,
         lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Native 7D action-head ablation (v28~v30) — E6, pi05_base.
+    #
+    # Replaces the 32D padded action interface with an embodiment-native 7D
+    # action head: action_dim=7, action_in_proj (7→1024) / action_out_proj
+    # (1024→7) are FRESHLY INITIALIZED (ReinitActionHeadCheckpointWeightLoader
+    # drops them from the pi05_base load). VLM + Action Expert + time_mlp are
+    # retained from pi05_base. Loss is over the real 7 dims (no padding).
+    #
+    # Ablation variable = vision LoRA layer range (SigLIP thirds):
+    #   v28 low (0,8)  /  v29 mid (9,17)  /  v30 late (18,26 = v23's winner)
+    # Everything else identical: action expert full LoRA r16, 15k steps
+    # (convergence cap, plateau ~10k), keep_period=None (latest ckpt only),
+    # shared 7D norm_stats (assets/pi05_e6_nat7d_lora — compute once).
+    # ─────────────────────────────────────────────────────────────────────────────
+    #
+    *[
+        TrainConfig(
+            name=f"pi05_e6_v{_v}_nat7d_{_tag}_lora",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=7,
+                action_horizon=16,
+                discrete_state_input=False,
+                paligemma_variant="gemma_2b",
+                action_expert_variant="gemma_300m_lora_r16",
+                vision_lora_rank=16,
+                vision_lora_alpha=16.0,
+                vision_lora_layer_range=_range,
+                action_expert_lora_layer_range=None,
+                wrist_image_keys=(),
+            ),
+            data=LeRobotE6DataConfig(
+                repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+                align_droid_state=False,
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    action_sequence_keys=("action",),
+                ),
+                assets=AssetsConfig(
+                    assets_dir="assets/pi05_e6_v30_nat7d_late_lora",  # shared 7D norm_stats (computed via v30)
+                    asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+                ),
+            ),
+            weight_loader=weight_loaders.ReinitActionHeadCheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            num_train_steps=15_000,
+            batch_size=8,
+            log_interval=50,
+            save_interval=5_000,
+            keep_period=None,
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+            freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+            ema_decay=None,
+        )
+        for _v, _tag, _range in (
+            (28, "lo", (0, 9)),
+            (29, "mid", (10, 17)),
+            (30, "late", (18, 26)),
+        )
+    ],
+    #
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Native-7D head runs — vision LoRA fixed at (18,26), pi05_base.
+    #   v30 = native 7D head, RANDOM init   (in the comprehension above)
+    #   v31 = native 7D head, SLICED init   (from pretrained head's leading 7 dims)
+    # 32D-masked variant dropped: the 32D regime is already covered by v1~v26,
+    # and v23 (32D-full) is the 32D reference point.
+    # ─────────────────────────────────────────────────────────────────────────────
+    #
+    TrainConfig(
+        name="pi05_e6_v31_nat7d_sliced_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=7,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v30_nat7d_late_lora",  # shared 7D norm_stats (computed via v30)
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.SlicedActionHeadCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=15_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5_000,
+        keep_period=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # v32: FULL VLM frozen (v1/v2 style) — no vision LoRA at all; only the action
+    #   expert LoRA (full 18 layers) + native 7D head (random init) are trained.
+    #   Baseline for "how much does vision LoRA contribute under the native head".
+    TrainConfig(
+        name="pi05_e6_v32_nat7d_vlmfrozen_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=7,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=None,  # no vision LoRA -> SigLIP fully frozen
+            action_expert_lora_layer_range=None,  # full action-expert LoRA
+            wrist_image_keys=(),
+        ),
+        data=LeRobotE6DataConfig(
+            repo_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            align_droid_state=False,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e6_v30_nat7d_late_lora",  # shared 7D norm_stats (computed via v30)
+                asset_id="Kyle-Riss/dobot_e6_pick_place_orange_v16",
+            ),
+        ),
+        weight_loader=weight_loaders.ReinitActionHeadCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=15_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=5_000,
+        keep_period=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        freeze_filter=pi0_config.freeze_filter_vlm_frozen_action_expert_lora_only(),
+        ema_decay=None,
+    ),
+    #
+    # ─────────────────────────────────────────────────────────────────────────────
+    # E7 configs — xArm 6 (6-DOF + gripper = 7D state/action)
+    #
+    # Robot  : UFACTORY xArm 6   (⚠ xArm *6*, not 7 — corrected 2026-07-23)
+    # Camera : HIK (top-view) + ZED (scene), 224×224, 16Hz  (same as E6)
+    # State  : 7D [j1..j6, gripper]        — same shape/semantics as E6
+    # Action : 7D [Δj1..Δj6, gripper_abs]
+    #   joint  (6D): velocity delta (deg/frame)
+    #   gripper(1D): absolute — 0.0=open, 1.0=close
+    #                executor: suction_cmd = 1 if action[6] > 0.5
+    #
+    # Keeping the policy contract byte-identical to E6 is the whole point of the
+    # E6→E7 comparison: same pi0.5, same 7D action semantics, same camera/language
+    # structure — only the embodiment and the execution interface change.
+    #
+    # ⚠ Execution interface differs from E6 and is NOT visible in the label:
+    #   collection teleop drives the arm in Cartesian velocity
+    #   (/xarm/vc_set_cartesian_velocity @ 20 Hz), while the label is the 16 Hz
+    #   measured joint delta. Inference therefore needs a joint-space execution
+    #   path (vc_set_joint_velocity / set_servo_angle_j) — verify on the robot
+    #   before collecting in bulk. Going Δq → Jacobian → twist instead breaks
+    #   near singularities.
+    # ─────────────────────────────────────────────────────────────────────────────
+    #
+    # E7 v1: baseline — vision LoRA (18~26), 7D state, absolute gripper.
+    #   - vision_lora_layer_range (18, 26): E6 ablation에서 v23으로 검증된 Late 전체 구간.
+    #   - Dataset: TODO — set repo_id once data is collected
+    #              (placeholder: Kyle-Riss/xarm_e7_v1)
+    #   - assets_dir: assets/pi05_e7_v1_lora  (run compute_norm_stats.py first)
+    #
+    TrainConfig(
+        name="pi05_e7_v1_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            # xArm6 has two cameras. E6 filled the third DROID slot with zeros,
+            # which cost 256 tokens + a SigLIP forward for nothing; dropping it
+            # is numerically a no-op (masked tokens neither shift positions nor
+            # participate in attention) so v23 stays loadable as an init.
+            # Sequence 984 → 728.
+            image_keys=("base_0_rgb", "left_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="Kyle-Riss/xarm_e7_v1",  # TODO: replace with actual repo_id
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_e7_v1_lora",
+                asset_id="Kyle-Riss/xarm_e7_v1",  # TODO: replace with actual repo_id
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E7 smoke — pipeline verification against a freshly converted pilot batch.
+    # Identical to pi05_e7_v1_lora except it points at the locally converted
+    # dataset and stops after 100 steps. Run this every time new data arrives,
+    # BEFORE committing to a full run: it catches shape mismatches, missing
+    # norm_stats and assets_dir typos in a couple of minutes instead of hours.
+    #   uv run examples/e7/convert_e7_to_lerobot.py --root <raw> --repo-id local/e7_pilot
+    #   uv run scripts/compute_norm_stats.py --config-name pi05_e7_smoke
+    #   uv run scripts/train.py pi05_e7_smoke --exp-name smoke
+    # ⚠ The norm_stats it produces are for the smoke run only — recompute on the
+    #   full collection before training for real.
+    #
+    TrainConfig(
+        name="pi05_e7_smoke",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v1",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_smoke", asset_id="local/e7_books_v1"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=100,
+        batch_size=8,
+        log_interval=10,
+        save_interval=100,
+        keep_period=None,
+        # warmup must stay below decay_steps — optax subtracts one from the other,
+        # and the default 1000-step warmup would make decay_steps negative here.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, decay_steps=100),
         freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),

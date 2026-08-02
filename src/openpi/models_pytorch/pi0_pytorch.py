@@ -164,7 +164,11 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        # Mirror the JAX path: honour the config's camera slots so a setup that
+        # drops an unused (zeros) slot saves the SigLIP forward on Jetson too.
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation, train=train, image_keys=tuple(getattr(self.config, "image_keys", _preprocessing.IMAGE_KEYS))
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

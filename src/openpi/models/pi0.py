@@ -72,6 +72,9 @@ class Pi0(_model.BaseModel):
         self._wrist_image_keys = (
             frozenset(config.wrist_image_keys) if config.wrist_image_keys is not None else None
         )
+        # Camera slots this model consumes, in token order. Slots dropped here are
+        # never embedded, saving 256 tokens + one SigLIP forward each.
+        self._image_keys = tuple(config.image_keys)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # v4: optionally scope action-expert LoRA to a specific layer range
@@ -217,7 +220,11 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, wrist_image_keys=self._wrist_image_keys
+            preprocess_rng,
+            observation,
+            train=train,
+            image_keys=self._image_keys,
+            wrist_image_keys=self._wrist_image_keys,
         )
 
         batch_shape = actions.shape[:-2]
@@ -254,7 +261,11 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(
-            None, observation, train=False, wrist_image_keys=self._wrist_image_keys
+            None,
+            observation,
+            train=False,
+            image_keys=self._image_keys,
+            wrist_image_keys=self._wrist_image_keys,
         )
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

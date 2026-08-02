@@ -62,6 +62,19 @@ class Pi0Config(_model.BaseModelConfig):
     # where both base_0_rgb (HIK) and left_wrist_0_rgb (ZED) are exterior cameras.
     wrist_image_keys: tuple[str, ...] | None = None
 
+    # Camera slots the model consumes, in token order. Defaults to the DROID
+    # 3-slot layout that pi0/pi0.5 were pretrained with.
+    #
+    # Setups that fill a slot with zeros (E6/E7 pass ``right_wrist_0_rgb`` as
+    # zeros + mask False) can drop it here instead: a masked slot contributes
+    # nothing to the loss but still costs 256 tokens of sequence and a full
+    # SigLIP forward. Dropping it is numerically a no-op for the surviving
+    # tokens — ``positions`` is ``cumsum(input_mask)-1`` so masked tokens add 0,
+    # and ``make_attn_mask``'s ``valid_mask`` blocks them in both directions —
+    # and parameter shapes are unaffected (SigLIP weights are reused per image),
+    # so checkpoints stay loadable across the change.
+    image_keys: tuple[str, ...] = _model.IMAGE_KEYS
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -97,16 +110,8 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={k: image_spec for k in self.image_keys},
+                image_masks={k: image_mask_spec for k in self.image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

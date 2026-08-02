@@ -55,6 +55,64 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class ReinitActionHeadCheckpointWeightLoader(WeightLoader):
+    """Loads a full checkpoint but EXCLUDES the action projection head so it is
+    re-initialized fresh at the model's ``action_dim``.
+
+    Use when replacing the pretrained padded action interface with an
+    embodiment-native action head (e.g. E6 native 7D). The pretrained VLM,
+    Action Expert transformer, and time_mlp are retained from the checkpoint;
+    only ``action_in_proj`` and ``action_out_proj`` are dropped so the model
+    initializes them at the new (smaller) ``action_dim``. LoRA adapters are
+    also freshly initialized, as with :class:`CheckpointWeightLoader`.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        # Drop the action projection head so it is re-initialized from `params`.
+        flat = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        flat = {k: v for k, v in flat.items() if "action_in_proj" not in k and "action_out_proj" not in k}
+        loaded_params = flax.traverse_util.unflatten_dict(flat, sep="/")
+        # Re-init the action head (and LoRA) from the reference params.
+        return _merge_params(loaded_params, params, missing_regex=".*(lora|action_in_proj|action_out_proj).*")
+
+
+@dataclasses.dataclass(frozen=True)
+class SlicedActionHeadCheckpointWeightLoader(WeightLoader):
+    """Loads a full checkpoint and SLICES the action projection head down to the
+    model's (smaller) ``action_dim`` instead of dropping it.
+
+        action_in_proj  kernel (D_ckpt, W) -> (D_model, W)   [first D_model rows]
+        action_out_proj kernel (W, D_ckpt) -> (W, D_model)   [first D_model cols]
+        action_out_proj bias   (D_ckpt,)   -> (D_model,)
+
+    Initializes a native action head from the pretrained head's leading dims
+    (vs random init), retaining VLM + Action Expert + time_mlp. LoRA is fresh.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        flat = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        ref = flax.traverse_util.flatten_dict(params, sep="/")
+        for k in list(flat):
+            if k not in ref:
+                continue
+            tgt = ref[k].shape
+            if "action_in_proj/kernel" in k:
+                flat[k] = flat[k][: tgt[0], :]
+            elif "action_out_proj/kernel" in k:
+                flat[k] = flat[k][:, : tgt[1]]
+            elif "action_out_proj/bias" in k:
+                flat[k] = flat[k][: tgt[0]]
+        loaded_params = flax.traverse_util.unflatten_dict(flat, sep="/")
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
