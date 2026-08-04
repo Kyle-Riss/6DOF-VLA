@@ -97,6 +97,7 @@ IMAGE_COL_ZED = "image_path_zed"
 
 # Optional integrity columns — guards are skipped when a column is absent.
 COL_DT = "dt_from_prev"
+COL_MOTION_SOURCE = "motion_source"
 COL_DROPPED = "frame_dropped_before"
 COL_NCMD = "n_commands_in_frame"
 COL_MODE = "robot_mode"
@@ -258,8 +259,7 @@ DEFAULT_TARGET = "target"
 # aim for insert ≈ 10-20% of the episode, and read the actual axis travel off the
 # "Insertion axis" line in the conversion report.
 INSERT_AXIS_WINDOW = 8      # frames before release used to estimate the insertion axis
-INSERT_ENTER_MM = 15.0      # travel along the axis that counts as "inside the slot"
-ALIGN_ENTER_MM = 60.0       # travel along the axis that counts as "lined up"
+INSERT_ENTER_MM = 300.0     # book length: the travel while the book crosses the shelf opening
 RETRACT_EXIT_MM = 10.0      # reverse travel after release that counts as retracting
 
 
@@ -286,6 +286,7 @@ def tasks_for(obj: str, tgt: str, schema: str) -> list[str]:
 # their own string the two could drift apart silently -- the tokens would
 # differ, the policy would degrade, and the degradation would be misattributed
 # to the policy. See examples/e7/e7_prompt/README.md.
+from episode_events import read_events  # noqa: E402
 from e7_prompt import (  # noqa: E402
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
@@ -498,15 +499,39 @@ def bridged_runs(mask: np.ndarray, bridge: int = 0) -> list[tuple[int, int]]:
     return out
 
 
-def demonstration_mask(df: pd.DataFrame, teleop_mode: int) -> np.ndarray:
-    """Frames the operator was actually driving: ``robot_mode == 5 OR teleop_enabled``.
+# Scripted motion the policy can be asked to reproduce, and motion it cannot.
+#
+# A waypoint route to the declared shelf is goal-directed and the goal is in the
+# prompt -- "carry the book to the center shelf" plus a grasped book determines
+# the move -- so cloning it is ordinary imitation learning from a planner. It
+# also has to be learned: drop it and the policy cannot travel at all, leaving
+# something else to drive the arm to the shelf at inference.
+#
+# A home return or an error recovery has no such account in the observation.
+# Trained across one, the policy learns to head home at moments it cannot
+# anticipate.
+LEARNABLE_SOURCES = ("waypoint_route",)
 
-    Either column may be absent; when both are, every frame is considered active and
-    the caller falls back to the first-motion trim.
+
+def demonstration_mask(df: pd.DataFrame, teleop_mode: int) -> np.ndarray:
+    """Frames the demonstration is made of: operator-driven, plus routed transit.
+
+    ``robot_mode == 5 OR teleop_enabled`` marks the operator. Waypoint-route
+    frames are added because the episode is deliberately collected that way --
+    the operator grasps, presses a shelf button, and inserts -- so requiring the
+    grasp and the release to sit inside ONE operator-driven run rejects every
+    such episode. On the first insertion episode that run split at 302..343 and
+    the whole thing was skipped.
+
+    Either column may be absent; when both are, every frame is considered active
+    and the caller falls back to the first-motion trim.
     """
     n = len(df)
     active = np.zeros(n, dtype=bool)
     seen = False
+    if COL_MOTION_SOURCE in df.columns:
+        src = df[COL_MOTION_SOURCE].astype(str).str.strip().str.lower()
+        active |= src.isin(LEARNABLE_SOURCES).values
     if COL_MODE in df.columns:
         active |= df[COL_MODE].values.astype(int) == teleop_mode
         seen = True
@@ -583,7 +608,8 @@ def repair_joint_spikes(df: pd.DataFrame, joint_cols: Sequence[str]) -> int:
 # ---------------------------------------------------------------------------
 
 def insertion_phases(
-    tcp: np.ndarray, close_idx: int, open_idx: int, n_frames: int
+    tcp: np.ndarray, close_idx: int, open_idx: int, n_frames: int,
+    arrival_idx: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """Per-frame phase array (0-7) for the insertion schema.
 
@@ -606,8 +632,20 @@ def insertion_phases(
     # slot is shorter than one chunk (which it was on the pilot: insert=0 frames).
     release_start = open_idx
 
-    # Insertion axis: direction of travel over the frames just before release.
-    lo = max(pick_end, open_idx - INSERT_AXIS_WINDOW)
+    # Insertion axis: from the frame the operator declared arrival at the shelf to
+    # the release. Both ends are events, so no threshold picks them.
+    #
+    # It used to be estimated from the last INSERT_AXIS_WINDOW frames before
+    # release, which was tuned on a top-down can place descending ~8 mm/frame. A
+    # shelf insertion moves ~1 mm/frame, so those 8 frames covered 9.5 mm of the
+    # operator's final settling wiggle and the estimated axis came out 120 degrees
+    # off the real one -- pointing mostly -y where the insertion runs +x. Every
+    # threshold then measured travel along a direction the arm was not moving in,
+    # and the align/insert split collapsed to zero frames whatever value it was
+    # given. Measured on the first real insertion episode: 9.5 mm of noise versus
+    # 414 mm of actual travel.
+    lo = arrival_idx if arrival_idx is not None and pick_end <= arrival_idx < open_idx else \
+        max(pick_end, open_idx - INSERT_AXIS_WINDOW)
     disp = tcp[open_idx] - tcp[lo]
     norm = float(np.linalg.norm(disp))
     degenerate = norm < 1.0
@@ -618,36 +656,37 @@ def insertion_phases(
     proj = (tcp - tcp[open_idx]) @ axis
 
     if degenerate:
-        span = release_start - pick_end
-        a_start = pick_end + int(span * 0.60)
-        i_start = pick_end + int(span * 0.85)
+        i_start = pick_end + int((release_start - pick_end) * 0.85)
     else:
         # Walk back from release: insert starts where the arm was still
-        # INSERT_ENTER_MM short of the slot, align where it was ALIGN_ENTER_MM short.
+        # INSERT_ENTER_MM short of the slot. That distance is the book's length --
+        # the travel while it crosses the opening -- so it is read off the object
+        # rather than tuned, and a different book only changes the number.
         i_start = release_start
         for i in range(release_start - 1, pick_end - 1, -1):
             if proj[i] < -INSERT_ENTER_MM:
                 i_start = i + 1
                 break
-        a_start = i_start
-        for i in range(i_start - 1, pick_end - 1, -1):
-            if proj[i] < -ALIGN_ENTER_MM:
-                a_start = i + 1
-                break
 
-    # 2 lift / 3 carry inside [pick_end, a_start): lift is the first third.
-    carry_span = a_start - pick_end
-    lift_end = pick_end + max(1, int(carry_span * 0.35)) if carry_span > 1 else a_start
+    # 2 lift / 3 carry inside [pick_end, i_start): lift is the first third.
+    carry_span = i_start - pick_end
+    lift_end = pick_end + max(1, int(carry_span * 0.35)) if carry_span > 1 else i_start
     phases[pick_end:lift_end] = 2
-    phases[lift_end:a_start] = 3
-    phases[a_start:i_start] = 4
-    phases[i_start:release_start] = 5
-    phases[release_start:] = 6
+    phases[lift_end:i_start] = 3
+    phases[i_start:release_start] = 4
+    phases[release_start:] = 5
 
     # 7 retract — after release, once the TCP has backed off along the axis.
+    #
+    # `proj` is measured from the release pose along the insertion direction, so
+    # withdrawing makes it NEGATIVE. The test used to read `> RETRACT_EXIT_MM`,
+    # which asks the arm to travel further INTO the shelf after letting go: it
+    # could never fire, and every episode reported retract as zero frames while
+    # the operator was plainly backing out (101 mm of it on the first insertion
+    # episode).
     for i in range(open_idx, n_frames):
-        if proj[i] > RETRACT_EXIT_MM:
-            phases[i:] = 7
+        if proj[i] < -RETRACT_EXIT_MM:
+            phases[i:] = 6
             break
 
     phases[phases < 0] = 3
@@ -1454,6 +1493,12 @@ def main(
             print(f"  NOTE {ep.name}: {len(pairs)} grasps [{shown}] — kept the longest carry "
                   f"{close_idx}→{open_idx}")
 
+        # Schema is chosen before the trim: the insertion schema keeps frames the
+        # planar one throws away, so the trim has to know which it is.
+        ep_schema = schema if schema != "auto" else (
+            "insertion" if "insert" in str(meta.get("task_id", "")).lower() else "planar"
+        )
+
         # -- trim ------------------------------------------------------------
         # The demonstration is the run of operator-driven frames containing the
         # grasp; everything outside it is a scripted home/anchor move or idle time.
@@ -1476,7 +1521,14 @@ def main(
                 lo = max(lo, max(prior) + 1)
             guard.mode_kept += hi_run - lo
             guard.mode_dropped += len(df_raw) - (hi_run - lo)
-            hi = min(open_idx + PLACE_SETTLE, hi_run)
+            # Keep the whole operator run for insertions. PLACE_SETTLE exists for
+            # the planar schema, where nothing after the release is worth learning
+            # -- the object is down and the arm just leaves. Withdrawing from a
+            # shelf is not that: the gripper is inside a slot alongside the book it
+            # just let go of, and backing out without dragging it is part of the
+            # task. Truncating here labelled 34 frames of deliberate retraction as
+            # nothing at all and left the retract phase permanently empty.
+            hi = hi_run if ep_schema == "insertion" else min(open_idx + PLACE_SETTLE, hi_run)
 
             # Any OTHER active run is teleoperated too — most often a manual retract
             # after the release. Dropping it silently would throw away real
@@ -1557,16 +1609,19 @@ def main(
             continue
 
         # -- phase segmentation ------------------------------------------------
-        ep_schema = schema if schema != "auto" else (
-            "insertion" if "insert" in str(meta.get("task_id", "")).lower() else "planar"
-        )
         if ep_schema == "insertion":
             if not {"x", "y", "z"} <= set(df.columns):
                 print(f"  SKIP {ep.name}: insertion schema needs TCP x/y/z columns")
                 skipped_eps += 1
                 continue
             tcp = df[["x", "y", "z"]].values.astype(np.float64)
-            phase_arr, axis, used_fallback = insertion_phases(tcp, pick_idx, open_idx, len(df))
+            # The declared arrival at the shelf, when the collector recorded one.
+            # It anchors the insertion axis and the carry->align boundary without
+            # a threshold; episodes predating the event fall back to geometry.
+            _tl = read_events(ep)
+            arrival = _tl.insertion_start_frame
+            phase_arr, axis, used_fallback = insertion_phases(
+                tcp, pick_idx, open_idx, len(df), arrival_idx=arrival)
             insert_axes.append(axis)
         else:
             phase_arr, used_fallback = compute_phases(df, pick_idx, open_idx)

@@ -139,8 +139,11 @@ PHASE_TEMPLATES: dict[str, tuple[str, ...]] = {
         "approach the {obj}",
         "grasp the {obj}",
         "lift the {obj}",
+        # No align stage. It was meant for lining the book up with the opening
+        # before pushing, but the shelf button puts the arm in front of the slot
+        # already aligned, so there was nothing between arriving and pushing: the
+        # phase came out empty on the first real insertion episode.
         "carry the {obj} to the {tgt} shelf",
-        "align the {obj} with the {tgt} shelf",
         "insert the {obj} into the {tgt} shelf",
         "release the {obj}",
         "retract from the {tgt} shelf",
@@ -149,7 +152,7 @@ PHASE_TEMPLATES: dict[str, tuple[str, ...]] = {
 
 PHASE_NAMES: dict[str, tuple[str, ...]] = {
     "planar": ("approach", "pick", "lift", "transport", "place", "release"),
-    "insertion": ("approach", "grasp", "lift", "carry", "align", "insert",
+    "insertion": ("approach", "grasp", "lift", "carry", "insert",
                   "release", "retract"),
 }
 

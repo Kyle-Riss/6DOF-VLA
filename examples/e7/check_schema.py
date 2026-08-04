@@ -36,13 +36,23 @@ REQUIRED_COLS = (*JOINT_COLS, GRIPPER_COL_GATED, IMAGE_COL_HIK, IMAGE_COL_ZED)
 GATE_COLS = (COL_MODE, COL_TELEOP)
 DIAGNOSTIC_COLS = (GRIPPER_COL_RAW, COL_DT, COL_DROPPED, COL_NCMD, *TWIST_RAW_COLS, *TWIST_SENT_COLS)
 
-# Motion the arm made on its own. Under the end-to-end contract none of it may
-# appear between the grasp and the release: the policy is meant to learn the
-# transit, and a stretch driven by a waypoint route is a trajectory whose trigger
-# -- a button press -- never enters the observation.
 COL_MOTION_SRC = "motion_source"
 COL_ACTIVE_SEQ = "active_sequence"
-SCRIPTED_SOURCES = ("waypoint_route", "script", "anchor_auto", "home_return", "error_recovery")
+
+# Scripted motion splits in two, and the split is whether the observation can
+# account for it.
+#
+# A waypoint route to the declared shelf is goal-directed and the goal is in the
+# prompt: given "carry the book to the center shelf" and a grasped book, the
+# motion follows. Cloning a planner is ordinary imitation learning, and excluding
+# it would leave the policy unable to travel at all -- something would have to
+# drive the arm to the shelf at inference too.
+#
+# A home return or an error recovery has no such account. Nothing in the image or
+# the prompt says why the arm left for the home pose, so a policy trained across
+# one learns to go home at unpredictable moments.
+LEARNABLE_SCRIPTED = ("waypoint_route",)
+UNPREDICTABLE_SCRIPTED = ("home_return", "error_recovery", "anchor_auto", "script")
 
 
 @dataclasses.dataclass
@@ -136,18 +146,22 @@ def check_scripted_motion(df: pd.DataFrame | None, r: Report) -> None:
 
     src = df[COL_MOTION_SRC].astype(str).str.strip().str.lower()
     carry = src.iloc[close:release + 1]
-    hits = carry[carry.isin(SCRIPTED_SOURCES)]
+    hits = carry[carry.isin(UNPREDICTABLE_SCRIPTED)]
+    routed = carry[carry.isin(LEARNABLE_SCRIPTED)]
     if hits.empty:
-        r.note(f"carry frames {close}..{release} are operator-driven throughout "
-               f"({carry.nunique()} distinct motion_source)")
+        if routed.empty:
+            r.note(f"carry frames {close}..{release} are operator-driven throughout")
+        else:
+            r.note(f"{len(routed)} waypoint-route frame(s) ({100.0 * len(routed) / max(1, release - close + 1):.1f}% "
+                   f"of the carry) — learnable: the destination they head for is named in the prompt")
         return
 
     counts = hits.value_counts().to_dict()
     pct = 100.0 * len(hits) / max(1, release - close + 1)
-    r.block(f"{len(hits)} scripted frame(s) ({pct:.1f}% of the carry) between grasp@{close} "
-            f"and release@{release}: {counts}. Under the end-to-end contract the operator "
-            f"drives the whole carry; a teach button moved the arm here, and the converter "
-            f"will drop this episode rather than teach the policy a motion it cannot predict")
+    r.block(f"{len(hits)} unpredictable scripted frame(s) ({pct:.1f}% of the carry) between "
+            f"grasp@{close} and release@{release}: {counts}. Nothing in the observation or the "
+            f"prompt accounts for these, so a policy trained across them learns to make the "
+            f"same move at moments it cannot anticipate")
     if COL_ACTIVE_SEQ in df.columns:
         seqs = sorted({s for s in df[COL_ACTIVE_SEQ].astype(str).str.strip().iloc[close:release + 1]
                        if s and s.lower() not in ("nan", "none")})
