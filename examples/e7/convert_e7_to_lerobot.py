@@ -1792,7 +1792,7 @@ def main(
             guard, all_actions, grip_values, gating_lags, fallback_eps,
             gcol, gripper_binarize, repo_id, action_semantics, clamp_mag, object_counts,
             schema_counts, insert_axes, prompt_source, prompt_counts, context_counts,
-            prompt_style, rule_tables)
+            cat_dest_counts, prompt_style, rule_tables)
 
     if push_to_hub:
         dataset.push_to_hub(tags=["e7", "xarm6", "openpi", "velocity", "phase-prompt"],
@@ -1804,7 +1804,7 @@ def _report(dataset, episode_paths, skipped_eps, total_frames, phase_counts, gua
             all_actions, grip_values, gating_lags, fallback_eps,
             gcol, gripper_binarize, repo_id, action_semantics, clamp_mag, object_counts,
             schema_counts, insert_axes, prompt_source, prompt_counts, context_counts,
-            prompt_style, rule_tables) -> None:
+            cat_dest_counts, prompt_style, rule_tables) -> None:
     print("\n" + "=" * 72)
     print("CONVERSION REPORT")
     print("=" * 72)
