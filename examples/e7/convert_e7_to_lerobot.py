@@ -122,6 +122,12 @@ GATE_BRIDGE_FRAMES = 8  # bridge flag flicker shorter than this when forming run
 # Twist clamping diagnostic (raw teleop vs what the driver actually accepted).
 TWIST_RAW_COLS = tuple(f"teleop_raw_{i}" for i in range(1, 7))
 TWIST_SENT_COLS = tuple(f"twist_sent_{i}" for i in range(1, 7))
+# What the arm was actually asked to do. NEITHER twist column is clutch-gated:
+# ep0 recorded teleop_raw == twist_sent == 0.073 for 68 frames while the clutch
+# was released and the arm stood still, because the operator's stick rests
+# off-centre. Reading a command out of those columns turns a coffee break into
+# a hardware fault, which is exactly the misdiagnosis this constant prevents.
+COMMAND_COLS = tuple(f"pre_limit_command_{i}" for i in range(1, 7))
 
 # episode_meta.json also carries `prompt_contract_hash` and `task_mapping_hash`
 # from the collector. This converter deliberately does not read them, and they are
@@ -797,6 +803,18 @@ class GuardReport:
     # "blocked here" -- a direct cause of a policy that freezes on hardware.
     stalls: list[str] = dataclasses.field(default_factory=list)
     stall_frames: int = 0
+    # Stretches where nothing was commanded at all -- the operator let go of the
+    # clutch and paused. Benign on the robot, but the policy cannot tell a pause
+    # from a block: both are a mid-reach scene with a ~0 action, and both teach
+    # it to stop there. Reported apart from stalls because the fix is different
+    # (ask the operator not to pause, vs. fix the robot).
+    pauses: list[str] = dataclasses.field(default_factory=list)
+    pause_frames: int = 0
+    # True when the clutch-gated command column was missing and the raw stick
+    # had to stand in for it. The raw stick keeps reporting an off-centre
+    # resting deflection after the clutch is released, so a pause then looks
+    # like a command that went unanswered.
+    stall_used_raw: bool = False
     # Frames where a joint crossed a +-360 wrap. The adjacent difference there
     # is a ~-360 deg/frame artefact, and the spike repair would silently turn
     # it into a fabricated value instead of flagging it.
@@ -827,47 +845,76 @@ STALL_TCP_FLOOR_MM = 0.15   # below this is measurement noise regardless of scal
 STALL_TCP_FRAC = 0.10       # ...or a tenth of this episode's median step, whichever is larger
 STALL_CMD_MIN = 0.05        # commanded twist magnitude above which the operator is "pushing"
 STALL_MIN_FRAMES = 8        # 0.5 s at 16 Hz — shorter is just a pause between motions
+# A pause has to be longer than a stall before it is worth reporting: stopping
+# for a third of a second between two motions is how anybody teleoperates, while
+# four seconds of nothing is a stretch of "hold still" in the training set.
+PAUSE_MIN_FRAMES = 24       # 1.5 s at 16 Hz
 WRAP_DEG = 180.0            # adjacent joint jump above this is a revolution wrap, not motion
 ZERO_DQ_WARN = 0.20         # >20% repeated joint vectors => feedback slower than ~13 Hz
 
 
-def detect_stalls(df: pd.DataFrame, ep_name: str, rep: GuardReport) -> np.ndarray:
-    """Mark frames where the operator was commanding but the arm did not move.
+def _runs(flags: np.ndarray, min_len: int):
+    """Contiguous True runs of at least ``min_len``, as half-open ranges."""
+    start = None
+    for i in range(len(flags) + 1):
+        if i < len(flags) and flags[i]:
+            start = i if start is None else start
+            continue
+        if start is not None and i - start >= min_len:
+            yield start, i
+        start = None
 
-    A stall is not a clamping artefact and not a pause: the twist is non-zero
-    and the TCP is not travelling, which means the controller is refusing the
-    motion. Those frames pair a near-zero action with a scene that looks like
-    mid-reach, so they teach the policy to stop exactly where it should push on.
+
+def detect_stalls(df: pd.DataFrame, ep_name: str, rep: GuardReport) -> np.ndarray:
+    """Separate "the arm refused to move" from "nobody asked it to".
+
+    Both look identical in the training set -- a mid-reach scene paired with a
+    ~0 action -- and both teach the policy to stop where it should push on. They
+    are reported apart because only one of them is the robot's fault, and
+    conflating them sends the wrong team looking. ep0 is the cautionary case: 68
+    frames of a released clutch were read as a joint-limit guard blocking
+    motion, and the search went to the robot instead of the operator.
+
+    The distinction rests entirely on reading a clutch-gated command column.
     """
     n = len(df)
     stalled = np.zeros(n, dtype=bool)
     if not ({"x", "y", "z"} <= set(df.columns)):
         rep.missing_cols.update({"x", "y", "z"})
         return stalled
-    if not all(c in df.columns for c in TWIST_RAW_COLS):
+
+    if all(c in df.columns for c in COMMAND_COLS):
+        cmd = np.abs(df[list(COMMAND_COLS)].to_numpy(float)).max(axis=1)
+    elif all(c in df.columns for c in TWIST_RAW_COLS):
+        # Pre-08-05 episodes have no command column. The raw stick over-reports
+        # (it never goes quiet), so stalls found this way are upper bounds and
+        # pauses cannot be told apart at all.
+        cmd = np.abs(df[list(TWIST_RAW_COLS)].to_numpy(float)).max(axis=1)
+        rep.stall_used_raw = True
+    else:
         return stalled
 
     tcp = df[["x", "y", "z"]].to_numpy(float)
     step_mm = np.r_[0.0, np.linalg.norm(np.diff(tcp, axis=0), axis=1)]
-    cmd = np.abs(df[list(TWIST_RAW_COLS)].to_numpy(float)).max(axis=1)
     thresh = max(STALL_TCP_FLOOR_MM, STALL_TCP_FRAC * float(np.median(step_mm[1:])))
-    candidate = (step_mm < thresh) & (cmd > STALL_CMD_MIN)
+    still = step_mm < thresh
 
-    # Keep only runs long enough to be a real block rather than a turnaround.
-    start = None
-    for i in range(n + 1):
-        if i < n and candidate[i]:
-            start = i if start is None else start
-            continue
-        if start is not None and i - start >= STALL_MIN_FRAMES:
-            stalled[start:i] = True
-            rep.stalls.append(
-                f"ep{ep_name} f{start}-{i - 1} ({i - start}f={(i - start) / 16.0:.1f}s) "
-                f"cmd~{cmd[start:i].mean():.2f} tcp~{step_mm[start:i].mean():.3f}mm/f "
-                f"(episode median {np.median(step_mm[1:]):.3f}, bar {thresh:.3f})"
-            )
-        start = None
+    for a, b in _runs(still & (cmd > STALL_CMD_MIN), STALL_MIN_FRAMES):
+        stalled[a:b] = True
+        rep.stalls.append(
+            f"ep{ep_name} f{a}-{b - 1} ({b - a}f={(b - a) / 16.0:.1f}s) "
+            f"cmd~{cmd[a:b].mean():.2f} tcp~{step_mm[a:b].mean():.3f}mm/f "
+            f"(episode median {np.median(step_mm[1:]):.3f}, bar {thresh:.3f})"
+        )
     rep.stall_frames += int(stalled.sum())
+
+    if not rep.stall_used_raw:
+        for a, b in _runs(still & (cmd <= STALL_CMD_MIN), PAUSE_MIN_FRAMES):
+            rep.pauses.append(
+                f"ep{ep_name} f{a}-{b - 1} ({b - a}f={(b - a) / 16.0:.1f}s) "
+                f"tcp~{step_mm[a:b].mean():.3f}mm/f"
+            )
+            rep.pause_frames += b - a
     return stalled
 
 
@@ -1977,6 +2024,23 @@ def _report(dataset, episode_paths, skipped_eps, total_frames, phase_counts, gua
         print("       action there is ~0 while the scene looks mid-reach, so training on it")
         print("       teaches the policy to freeze exactly where it should push through.")
         print("       Fix the cause on the robot; excluding them only hides the gap.")
+    if guard.stall_used_raw:
+        print("    ⚠  no pre_limit_command column — stalls were judged from the raw stick,")
+        print("       which keeps reporting an off-centre resting deflection after the")
+        print("       clutch is released. Treat the count as an upper bound, and note that")
+        print("       operator pauses cannot be separated out at all in these episodes.")
+
+    if guard.pauses:
+        print(f"    ⚠  operator pauses: {len(guard.pauses)} run(s), {guard.pause_frames} frames "
+              f"({100 * guard.pause_frames / max(total_frames, 1):.1f}% of kept frames)")
+        for s in guard.pauses[:8]:
+            print(f"       {s}")
+        if len(guard.pauses) > 8:
+            print(f"       … and {len(guard.pauses) - 8} more")
+        print("       Clutch released, nothing commanded, arm still. Harmless on the robot,")
+        print("       but the policy sees the same thing a stall looks like: a mid-reach")
+        print("       scene with a ~0 action. Not excluded here — dropping frames mid-episode")
+        print("       would splice the action chunks — so keep pauses out at collection time.")
 
     if guard.joint_wraps:
         print(f"    🔴 revolution wraps: {len(guard.joint_wraps)}")
