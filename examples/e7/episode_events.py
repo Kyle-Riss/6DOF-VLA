@@ -32,6 +32,15 @@ EV_REQUESTED = "teach_requested"
 EV_ARRIVED = "teach_arrived"
 EV_ABORTED = "teach_aborted"
 
+# The end-to-end contract removed the arm motion from the destination button, and
+# with it `teach_arrived` -- the frame that used to mark where the insertion
+# began. The operator now presses on starting the approach and the arm does not
+# move, so the press itself is the boundary. It is still a declaration and still
+# carries no threshold, which is the property that made it usable in the first
+# place: the pilot was collected to find out how close counts as arrived, so that
+# distance cannot also be what decides it.
+EV_DECLARED = "destination_declared"
+
 
 @dataclasses.dataclass
 class Event:
@@ -50,8 +59,23 @@ class TeachTimeline:
 
     @property
     def shelf_arrivals(self) -> list[Event]:
+        """Frames that name a destination: a declaration, or a completed teach move.
+
+        Both are read because both exist in the archive. Episodes up to 08-04 were
+        collected with the button driving the arm, so their boundary is
+        ``teach_arrived``; everything after declares without moving. An episode
+        carrying both would be a collector regression -- the declaration button is
+        not supposed to move the arm any more -- so it is reported rather than
+        silently merged.
+        """
         return [e for e in self.events
-                if e.name == EV_ARRIVED and e.value in SHELF_BUTTONS]
+                if e.name in (EV_DECLARED, EV_ARRIVED) and e.value in SHELF_BUTTONS]
+
+    @property
+    def declares_and_moves(self) -> bool:
+        """True when an episode both declares and drives the arm to a shelf."""
+        names = {e.name for e in self.events if e.value in SHELF_BUTTONS}
+        return EV_DECLARED in names and EV_ARRIVED in names
 
     @property
     def declared_shelf_id(self) -> str:
@@ -67,11 +91,11 @@ class TeachTimeline:
 
     @property
     def insertion_start_frame(self) -> int | None:
-        """Frame the arm finished its move to the shelf — the insertion begins.
+        """Frame the operator committed to a shelf — where the insertion begins.
 
-        This is the boundary that could not be derived before. Distance to the
-        shelf cannot supply it, because how close is close enough is the question
-        the pilot was collected to answer.
+        The boundary that could not be derived before. Distance to the shelf
+        cannot supply it, because how close is close enough is exactly the
+        question the pilot was collected to answer.
         """
         arrivals = self.shelf_arrivals
         return arrivals[-1].frame if arrivals else None
