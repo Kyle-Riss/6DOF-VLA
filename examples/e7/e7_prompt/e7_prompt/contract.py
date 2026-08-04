@@ -23,6 +23,7 @@ from collections.abc import Mapping
 from .templates import (
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
+    PHASE_TEMPLATES,
     CATEGORY_EN,
     RIG_LAYOUT,
     PROMPT_TEMPLATES,
@@ -75,6 +76,7 @@ def contract_payload(
         "contract_version": CONTRACT_VERSION,
         "prompt_style": prompt_style,
         "templates": dict(sorted(PROMPT_TEMPLATES.items())),
+        "phase_templates": {k: list(v) for k, v in sorted(PHASE_TEMPLATES.items())},
         "category_map": dict(sorted(CATEGORY_EN.items())),
         "categories": sorted(CANONICAL_CATEGORIES),
         "destinations": sorted(CANONICAL_DESTINATIONS),

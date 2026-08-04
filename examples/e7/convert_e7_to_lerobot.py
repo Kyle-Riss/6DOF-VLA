@@ -218,6 +218,13 @@ CONTEXT_KEYS = (
     # far short the release stopped rather than by which shelf it stopped at.
     "nearest_shelf_id", "nearest_shelf_lateral_mm", "nearest_shelf_depth_mm",
     "nearest_shelf_assignment_axis",
+    # Which template produced `instruction`, and the preview shown before the
+    # destination was declared. The preview comes from the label table and the
+    # final string from the button, so the two disagreeing marks a counterfactual
+    # episode rather than an error -- worth grouping on, never worth training on.
+    "instruction_style", "instruction_template", "instruction_destination_included",
+    "instruction_preview_at_start", "instruction_category_only",
+    "intended_matches_label_derived", "prompt_package_version",
 )
 
 # episode_meta keys that may carry the observed landing shelf, in priority order.
@@ -239,32 +246,6 @@ ACTUAL_DIST_KEYS = ("nearest_shelf_lateral_mm", "actual_shelf_distance_mm",
 # {obj} is filled from episode_meta["prompt_object_name"], {tgt} from
 # ["target_shelf"] — a mixed collection therefore yields distinct prompts rather
 # than mislabelling everything as one object/destination.
-PLANAR_TEMPLATES: list[str] = [
-    "approach the {obj}",                  # 0
-    "pick up the {obj}",                   # 1
-    "lift the {obj}",                      # 2
-    "move the {obj} to the target area",   # 3
-    "place the {obj} in the target area",  # 4
-    "release the {obj}",                   # 5
-]
-PLANAR_NAMES = ["approach", "pick", "lift", "transport", "place", "release"]
-
-INSERTION_TEMPLATES: list[str] = [
-    "approach the {obj}",                      # 0
-    "grasp the {obj}",                         # 1
-    "lift the {obj}",                          # 2
-    "carry the {obj} to the {tgt} shelf",      # 3
-    "align the {obj} with the {tgt} shelf",    # 4
-    "insert the {obj} into the {tgt} shelf",   # 5
-    "release the {obj}",                       # 6
-    "retract from the {tgt} shelf",            # 7
-]
-INSERTION_NAMES = ["approach", "grasp", "lift", "carry", "align", "insert", "release", "retract"]
-
-SCHEMAS = {
-    "planar": (PLANAR_TEMPLATES, PLANAR_NAMES),
-    "insertion": (INSERTION_TEMPLATES, INSERTION_NAMES),
-}
 DEFAULT_OBJECT = "object"
 DEFAULT_TARGET = "target"
 
@@ -283,8 +264,7 @@ RETRACT_EXIT_MM = 10.0      # reverse travel after release that counts as retrac
 
 
 def tasks_for(obj: str, tgt: str, schema: str) -> list[str]:
-    templates, _ = SCHEMAS[schema]
-    return [t.format(obj=obj, tgt=tgt) for t in templates]
+    return render_phase_prompts(schema, obj, tgt)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +289,9 @@ def tasks_for(obj: str, tgt: str, schema: str) -> list[str]:
 from e7_prompt import (  # noqa: E402
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
+    PHASE_NAMES,
+    PHASE_TEMPLATES,
+    render_phase_prompts,
     INCOMPLETE,
     PROMPT_TEMPLATES,
     TokenizerSpec,
@@ -319,6 +302,18 @@ from e7_prompt import (  # noqa: E402
     render_from_meta,
     validate_all,
 )
+
+
+# Phase templates now live in the shared `e7_prompt` package so the robot renders
+# the SAME strings at inference and the contract hash covers them. Names are kept
+# here only as the converter's local aliases.
+PLANAR_NAMES = list(PHASE_NAMES["planar"])
+INSERTION_NAMES = list(PHASE_NAMES["insertion"])
+
+SCHEMAS = {
+    "planar": (list(PHASE_TEMPLATES["planar"]), PLANAR_NAMES),
+    "insertion": (list(PHASE_TEMPLATES["insertion"]), INSERTION_NAMES),
+}
 
 
 def build_rule_tables(episode_paths: Sequence[Path]) -> tuple[dict[str, dict[str, str]], list[str]]:
@@ -1579,9 +1574,19 @@ def main(
         schema_counts[ep_schema] = schema_counts.get(ep_schema, 0) + 1
 
         # -- prompt -----------------------------------------------------------
-        obj = str(meta.get("prompt_object_name") or meta.get("object_label") or DEFAULT_OBJECT)
-        tgt = resolved_target_side(meta) or str(meta.get("shelf_color") or meta.get("target_color")
-                  or DEFAULT_TARGET)
+        # No fallback to object_label: it holds an identifier like "science_001",
+        # which renders as "approach the science_001" -- a string outside the
+        # contract that no gate compares against, carrying the book id straight
+        # into the tokenizer. An absent name is a collector gap, not a default.
+        obj = str(meta.get("prompt_object_name") or "").strip()
+        assert obj, (f"{ep.name}: phase prompts need episode_meta['prompt_object_name'] "
+                     f"(set it to 'book'); refusing to invent one")
+        # No fallback. An episode without a declared destination is skipped long
+        # before this point; reaching here with an empty string would mean the
+        # skip was bypassed, and "carry the book to the target shelf" is a
+        # sentence that reads fine and names nowhere.
+        tgt = resolved_target_side(meta)
+        assert tgt, f"{ep.name}: phase prompts need a declared destination"
         phase_tasks = tasks_for(obj, tgt, ep_schema)
 
         # ``meta``  — episode_meta["prompt"], constant for the whole episode. This is
@@ -1602,8 +1607,15 @@ def main(
         ep_prompt = None
         if prompt_source == "rendered":
             ep_prompt = render_prompt(meta, prompt_style, rule_tables)
-            if ep_prompt is None and meta.get("prompt"):
-                ep_prompt = str(meta["prompt"])   # fall back to the collector string
+            if ep_prompt is None:
+                # The collector writes its rendered string under `instruction`;
+                # older episodes used `prompt`. Both are the SAME renderer output,
+                # not a derived value, so reading them is not the fallback that had
+                # to be removed from the destination lookup.
+                for _k in ("instruction", "prompt"):
+                    if meta.get(_k):
+                        ep_prompt = str(meta[_k])
+                        break
                 guard.unrendered_eps.append(ep.name)
         elif prompt_source == "meta" and meta.get("prompt"):
             ep_prompt = str(meta["prompt"])

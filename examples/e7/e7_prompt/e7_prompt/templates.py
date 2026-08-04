@@ -27,8 +27,19 @@ PROMPT_TEMPLATES: dict[str, str] = {
     # category the classifier returned, which is exactly what the MacBook tool
     # provides -- no lookup table has to be kept in sync on the robot.
     "category_only": "place the {cat} book in the appropriate shelf",
-    # Names the destination. Cheap for the policy, but inference must resolve
-    # category -> shelf somewhere, so a table still has to ship and stay in sync.
+    # Destination and nothing else. For the split where scene understanding runs
+    # off-device: the classifier reads the book, reads the shelf signs, resolves
+    # which shelf this book belongs in, and the policy is told only where to put
+    # it. The book is already grasped by then, so its category cannot inform the
+    # motion and carrying it in the prompt only creates a shortcut -- within a
+    # batch the category and the shelf move together, so a policy can answer from
+    # the category word and never read the destination. Leaving it out makes the
+    # destination word the only thing that can be read, and the only thing that
+    # can be varied to test whether it was.
+    "destination_only": "insert the book into the {tgt} shelf",
+    # Names the destination and the category. Useful as an ablation against
+    # destination_only -- if the two score the same, the category word is being
+    # ignored, which is what it should be once the book is in the gripper.
     "resolved":    "category={cat}. insert the {cat} book into the {tgt} shelf",
     "single_rule": "category={cat}. rule: {cat}->{tgt}. "
                    "insert the {cat} book into the correct shelf",
@@ -36,11 +47,13 @@ PROMPT_TEMPLATES: dict[str, str] = {
                    "insert the {cat} book into the correct shelf",
 }
 
-PROMPT_STYLES: tuple[str, ...] = ("category_only", "resolved", "single_rule", "rule_table")
+PROMPT_STYLES: tuple[str, ...] = ("category_only", "destination_only", "resolved",
+                                 "single_rule", "rule_table")
 
 # Styles whose prompt text contains the destination. Everything else has to
 # recover it from the weights, which means inference needs no shelf table.
-STYLES_NEEDING_TARGET: frozenset[str] = frozenset({"resolved", "single_rule", "rule_table"})
+STYLES_NEEDING_TARGET: frozenset[str] = frozenset(
+    {"destination_only", "resolved", "single_rule", "rule_table"})
 
 # The three book categories, in the canonical English form that reaches the
 # tokenizer. The frozen Gemma 2B saw overwhelmingly English text and E6 used
@@ -88,3 +101,65 @@ CATEGORY_EN: dict[str, str] = {
 def canonical_category(raw: str) -> str:
     """Map a collector label to its canonical English form."""
     return CATEGORY_EN.get(raw.strip(), raw.strip())
+
+
+# ---------------------------------------------------------------------------
+# Per-phase prompts
+# ---------------------------------------------------------------------------
+#
+# One string per stage of the episode instead of one per episode. E6 is the
+# evidence: v2 conditioned on a single episode-level string and failed on the
+# robot; v16 onward published a per-frame phase prompt and worked, and v23 -- the
+# run adopted as the E7 starting point -- was trained that way.
+#
+# The reason is structural. pi0.5 sees ONE frame, with no history. Approaching a
+# shelf and withdrawing from it put the arm in nearly the same place, and the
+# gripper only separates them once it has already opened. A phase prompt supplies
+# the stage the observation cannot.
+#
+# These live here rather than in the converter because the robot needs the same
+# strings at inference. A phase prompt that differs by one character between
+# training and serving conditions the policy on a sentence it never saw, and the
+# tokenizer will not complain. Being in this module also puts them in the
+# contract hash, so such a drift is caught at load time instead of in behaviour.
+#
+# {obj} comes from episode_meta["prompt_object_name"], {tgt} from the operator's
+# declared destination -- never from the label-derived field, for the reason
+# given in `render.py`.
+PHASE_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "planar": (
+        "approach the {obj}",
+        "pick up the {obj}",
+        "lift the {obj}",
+        "move the {obj} to the target area",
+        "place the {obj} in the target area",
+        "release the {obj}",
+    ),
+    "insertion": (
+        "approach the {obj}",
+        "grasp the {obj}",
+        "lift the {obj}",
+        "carry the {obj} to the {tgt} shelf",
+        "align the {obj} with the {tgt} shelf",
+        "insert the {obj} into the {tgt} shelf",
+        "release the {obj}",
+        "retract from the {tgt} shelf",
+    ),
+}
+
+PHASE_NAMES: dict[str, tuple[str, ...]] = {
+    "planar": ("approach", "pick", "lift", "transport", "place", "release"),
+    "insertion": ("approach", "grasp", "lift", "carry", "align", "insert",
+                  "release", "retract"),
+}
+
+
+def render_phase_prompts(schema: str, obj: str, tgt: str) -> list[str]:
+    """Every phase string for one episode, in phase order.
+
+    Raises on an unknown schema rather than defaulting: a silently wrong schema
+    produces prompts that read correctly and label the wrong frames.
+    """
+    if schema not in PHASE_TEMPLATES:
+        raise KeyError(f"unknown phase schema {schema!r}; have {sorted(PHASE_TEMPLATES)}")
+    return [t.format(obj=obj, tgt=tgt) for t in PHASE_TEMPLATES[schema]]

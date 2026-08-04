@@ -21,6 +21,9 @@ from .render import ContextSpec, render_from_meta, render_prompt
 from .templates import (
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
+    PHASE_TEMPLATES,
+    PHASE_NAMES,
+    render_phase_prompts,
     CATEGORY_EN,
     PROMPT_STYLES,
     PROMPT_TEMPLATES,
@@ -44,6 +47,9 @@ __version__ = CONTRACT_VERSION
 __all__ = [
     "CANONICAL_CATEGORIES",
     "CANONICAL_DESTINATIONS",
+    "PHASE_TEMPLATES",
+    "PHASE_NAMES",
+    "render_phase_prompts",
     "CATEGORY_EN",
     "CONTRACT_VERSION",
     "DEFAULT_TOKENIZER_ID",
