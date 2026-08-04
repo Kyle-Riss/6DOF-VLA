@@ -201,13 +201,32 @@ CONTEXT_KEYS = (
     # The thresholds in force when the classifier response was judged. Without
     # these a later run with a different threshold is not comparable.
     "mcp_confidence_threshold", "book_bbox_max_clip_ratio", "mcp_schema_version",
+    # The teach-button declaration, kept beside the value it overrides. The
+    # collector used to write one destination field holding whichever of the two
+    # it had; splitting them is what made the 08-04 mislabelling visible at all,
+    # so both travel with the dataset and an audit can still see the disagreement.
+    "intended_shelf_id", "intended_shelf_side", "intended_shelf_source",
+    "intended_shelf_button_presses", "intended_matches_nearest",
+    "target_resolution_status", "target_resolution_reason", "target_resolution_source",
+    # What the shelf-label table would have said. Recorded, never derived from:
+    # on a single-category batch it returns the same shelf every time.
+    "label_derived_target_shelf_id", "label_derived_target_side",
+    "label_derived_resolution_status", "label_derived_resolution_reason",
+    # Where the book actually landed, assigned on lateral distance alone. Depth is
+    # reported separately because it measures a different thing -- how far into the
+    # shelf the arm went -- and folding it into the assignment ranks shelves by how
+    # far short the release stopped rather than by which shelf it stopped at.
+    "nearest_shelf_id", "nearest_shelf_lateral_mm", "nearest_shelf_depth_mm",
+    "nearest_shelf_assignment_axis",
 )
 
 # episode_meta keys that may carry the observed landing shelf, in priority order.
 ACTUAL_SHELF_KEYS = ("actual_shelf", "actual_shelf_label", "released_shelf", "nearest_shelf")
 # ...and the release-to-waypoint distance, for judging whether the landing is even
-# well defined.
-ACTUAL_DIST_KEYS = ("actual_shelf_distance_mm", "release_shelf_distance_mm", "nearest_shelf_distance_mm")
+# well defined. Lateral first: it is the axis the landing is assigned on, so it is
+# the one the target-vs-actual comparison should report.
+ACTUAL_DIST_KEYS = ("nearest_shelf_lateral_mm", "actual_shelf_distance_mm",
+                    "release_shelf_distance_mm", "nearest_shelf_distance_mm")
 
 # Two phase schemas, selected by episode_meta["task_id"].
 #
@@ -338,6 +357,47 @@ def render_prompt(meta: dict, style: str, rule_tables: dict[str, dict[str, str]]
     both refer to it.
     """
     return render_from_meta(meta, style, rule_tables)
+
+
+def _report_category_destination_matrix(counts: dict[tuple[str, str], int]) -> None:
+    """Print how each category was distributed over destinations, and say what that permits.
+
+    This is the measurement that decides whether the destination word in the
+    prompt does any work. If a category always went to the same shelf, a policy
+    can answer every episode from the category alone and never read the rest of
+    the sentence -- the destination is then decoration, and prompt-sensitivity
+    cannot be scored no matter how the eval is written. The batch has to break
+    that correlation before the question is askable.
+
+    Three destinations per category is the goal rather than two: with two, a
+    held-out third combination has no training support, so a failure on it says
+    nothing about whether the policy reads the destination or simply never saw
+    that shelf named.
+    """
+    if not counts:
+        return
+    cats = sorted({c for c, _ in counts})
+    dests = [d for d in CANONICAL_DESTINATIONS if any(d == x for _, x in counts)]
+    print("\n  Category x destination (episodes):")
+    print("    " + " " * 14 + "".join(f"{d:>10}" for d in dests) + "     distinct")
+    for c in cats:
+        row = [counts.get((c, d), 0) for d in dests]
+        n = sum(1 for v in row if v)
+        flag = "" if n >= 3 else ("  <- one destination only" if n < 2 else "  <- two")
+        print(f"    {c:14}" + "".join(f"{v:>10}" for v in row) + f"{n:>13}{flag}")
+
+    worst = min((sum(1 for d in dests if counts.get((c, d), 0)) for c in cats), default=0)
+    if worst >= 3:
+        print("    every category reaches all three shelves — the destination word carries")
+        print("    information the category word cannot supply, so prompt-sensitivity is")
+        print("    measurable: hold the observation fixed, vary only the destination.")
+    elif worst == 2:
+        print("    ⚠ some category reaches only two shelves. Better than one, but the third")
+        print("      combination is untrained, so a miss there is unattributable.")
+    else:
+        print("    ⚠ some category reaches ONE shelf. The policy can satisfy every episode")
+        print("      from the category alone; the destination word is unfalsifiable here.")
+        print("      Move the shelf signs so the same category is demonstrated elsewhere.")
 
 
 def _build_contract_manifest(
@@ -819,12 +879,30 @@ def _sides_from_waypoint_y(ys: dict) -> tuple[dict[str, str] | None, str | None]
 
 # The destination a demonstration was actually recorded against.
 #
-# `resolved_target_side` is the one the collector resolved from that episode's own
-# shelf labels. `legacy_static_target_shelf_id` is the pre-v5 static field and is
-# deliberately NOT consulted: it names a waypoint under the default arrangement, so
-# reading it on a shuffled batch quietly points at the wrong shelf.
-RESOLVED_SIDE_KEYS = ("resolved_target_side", "target_shelf")
+# `resolved_target_side` is the operator's declaration, taken from which teach
+# button was pressed. It is the ONLY key read here, and that is deliberate.
+#
+# The collector used to derive the destination from the episode's shelf labels
+# and the book's category. On the 08-04 batch that derivation returned "right"
+# for all twelve episodes -- one category and a fixed arrangement always resolve
+# to the same shelf -- while the operator had actually filled three shelves, four
+# episodes each. The collector now writes the derived value under
+# `label_derived_target_side` and leaves `resolved_target_side` null when no
+# button was pressed, so an episode with no declaration is dropped rather than
+# labelled by a table.
+#
+# `target_shelf` was in this list and had to come out. It still carries the
+# derived value, so keeping it as a fallback reinstated exactly the mislabelling
+# the collector had just been changed to prevent: null resolved_target_side would
+# fall through and return "right" again, silently. A fallback that reaches a
+# lower-authority field is not a safety net here, it is the bug.
+#
+# `legacy_static_target_shelf_id` is the pre-v5 static field and is likewise not
+# consulted: it names a waypoint under the default arrangement, so reading it on
+# a shuffled batch points at the wrong shelf.
+RESOLVED_SIDE_KEYS = ("resolved_target_side",)
 LEGACY_TARGET_KEYS = ("legacy_static_target_shelf_id", "target_shelf_id")
+DERIVED_TARGET_KEYS = ("label_derived_target_side", "target_shelf")
 
 
 def resolved_target_side(meta: dict) -> str:
@@ -834,6 +912,21 @@ def resolved_target_side(meta: dict) -> str:
         if v:
             return v
     return ""
+
+
+def derived_only_target(meta: dict) -> str | None:
+    """A label-derived destination present while the declared one is absent.
+
+    Reported rather than used. The distinction matters when reading a skip: an
+    episode that names no destination at all was recorded without a teach press,
+    while one carrying only a derived value had the press lost or never wired.
+    """
+    if resolved_target_side(meta):
+        return None
+    for k in DERIVED_TARGET_KEYS:
+        if str(meta.get(k) or "").strip():
+            return k
+    return None
 
 
 def legacy_only_target(meta: dict) -> str | None:
@@ -1205,6 +1298,7 @@ def main(
     insert_axes: list[np.ndarray] = []
     prompt_counts: dict[str, int] = {}
     context_counts: dict[str, dict[str, int]] = {}
+    cat_dest_counts: dict[tuple[str, str], int] = {}
     episode_context: dict[int, dict[str, str]] = {}
 
     total_frames = 0
@@ -1534,6 +1628,13 @@ def main(
         for k in CONTEXT_KEYS:
             context_counts.setdefault(k, {})
             context_counts[k][ep_context[k]] = context_counts[k].get(ep_context[k], 0) + 1
+        # Counted as a pair, not two independent tallies: the question is whether
+        # category and destination vary TOGETHER, and marginal counts cannot say.
+        # Twelve episodes split 4/4/4 over destinations look balanced in the
+        # margin while every one of them carries the same category.
+        if (_c := canonical_category(str(meta.get("category") or ""))) and (
+                _d := resolved_target_side(meta)):
+            cat_dest_counts[(_c, _d)] = cat_dest_counts.get((_c, _d), 0) + 1
         episode_context[len(episode_context)] = {
             "episode_dir": ep.name, "prompt": ep_tasks[0], "schema": ep_schema, **ep_context,
         }
@@ -1726,15 +1827,7 @@ def _report(dataset, episode_paths, skipped_eps, total_frames, phase_counts, gua
                 print(f"    {k:14s} ⚠ absent")
                 continue
             print(f"    {k:14s} {dict(sorted(vals.items()))}")
-        rules = {k: v for k, v in (context_counts.get("rule_version") or {}).items() if k}
-        cats = {k: v for k, v in (context_counts.get("category") or {}).items() if k}
-        shelves = {k: v for k, v in (context_counts.get("shelf_color") or {}).items() if k}
-        if len(rules) < 2 or len(shelves) < 2:
-            print("    ⚠ counterfactual not yet testable: it needs the SAME category mapped to")
-            print("      DIFFERENT shelves across rule_version. With one rule (or one shelf) the")
-            print("      policy can satisfy every episode by memorising the destination, and a")
-            print(f"      held-out rule cannot be scored. (rules={sorted(rules)}, "
-                  f"categories={sorted(cats)}, shelves={sorted(shelves)})")
+        _report_category_destination_matrix(cat_dest_counts)
 
     if schema_counts:
         print(f"  Phase schema   : {dict(sorted(schema_counts.items()))}")

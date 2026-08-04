@@ -86,12 +86,20 @@ def render_from_meta(
 ) -> str | None:
     """Adapter for ``episode_meta.json`` dicts. ``None`` if fields are missing.
 
-    Accepts ``category`` or ``object_category``, and ``target_shelf`` or the
-    legacy ``shelf_color``, so a collector schema change does not silently fall
-    back to the baked-in prompt string.
+    The destination comes from ``resolved_target_side`` and nowhere else. That
+    field holds the operator's teach-button declaration; ``target_shelf`` holds a
+    value the collector derives from the shelf labels and the book's category,
+    and on a single-category batch that derivation returns the same shelf for
+    every episode. Rendering from it produced twelve identical prompts for the
+    08-04 batch while the arm had visited three different shelves -- the prompt
+    then contradicts the demonstration, which teaches that the prompt is noise.
+
+    This is the same fallback that had to be removed from the converter, and it
+    matters more here: the prompt is the one string shared between training and
+    inference, so a destination taken from the wrong field is wrong in both.
     """
     cat = canonical_category(str(meta.get("category") or meta.get("object_category") or ""))
-    tgt = str(meta.get("target_shelf") or meta.get("shelf_color") or "").strip()
+    tgt = str(meta.get("resolved_target_side") or "").strip().lower()
     if not cat:
         return None
     if not tgt and style in STYLES_NEEDING_TARGET:
