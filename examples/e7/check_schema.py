@@ -26,7 +26,7 @@ from convert_e7_to_lerobot import (  # noqa: E402
     COL_DROPPED, COL_DT, COL_MODE, COL_NCMD, COL_TELEOP, CONTEXT_KEYS,
     GRIPPER_COL_GATED, GRIPPER_COL_RAW, IMAGE_COL_HIK, IMAGE_COL_ZED,
     JOINT_COLS, META_CONTRACT, MIN_SCHEMA_VERSION, TWIST_RAW_COLS, TWIST_SENT_COLS,
-    _sides_from_waypoint_y, legacy_only_target, resolved_target_side,
+    _sides_from_waypoint_y, derived_only_target, legacy_only_target, resolved_target_side,
 )
 from make_v5_fixture import CSV_COLS as FIXTURE_COLS  # noqa: E402
 
@@ -35,6 +35,14 @@ from e7_prompt import CANONICAL_CATEGORIES, CANONICAL_DESTINATIONS, RIG_LAYOUT, 
 REQUIRED_COLS = (*JOINT_COLS, GRIPPER_COL_GATED, IMAGE_COL_HIK, IMAGE_COL_ZED)
 GATE_COLS = (COL_MODE, COL_TELEOP)
 DIAGNOSTIC_COLS = (GRIPPER_COL_RAW, COL_DT, COL_DROPPED, COL_NCMD, *TWIST_RAW_COLS, *TWIST_SENT_COLS)
+
+# Motion the arm made on its own. Under the end-to-end contract none of it may
+# appear between the grasp and the release: the policy is meant to learn the
+# transit, and a stretch driven by a waypoint route is a trajectory whose trigger
+# -- a button press -- never enters the observation.
+COL_MOTION_SRC = "motion_source"
+COL_ACTIVE_SEQ = "active_sequence"
+SCRIPTED_SOURCES = ("waypoint_route", "script", "anchor_auto", "home_return", "error_recovery")
 
 
 @dataclasses.dataclass
@@ -104,6 +112,50 @@ def check_csv(ep: pathlib.Path, fps: float, r: Report) -> pd.DataFrame | None:
     return df
 
 
+def check_scripted_motion(df: pd.DataFrame | None, r: Report) -> None:
+    """Scripted motion between the grasp and the release breaks the end-to-end contract.
+
+    This is the check the 08-04 batch needed and did not have. Every frame in it
+    passed inspection -- rate, skew, exposure, gating all clean -- because the
+    defect was not in any frame. It was in who moved the arm: the operator picked
+    the book, a teach button drove it to the shelf, the operator placed it. Eleven
+    of twelve episodes were unusable and nothing in the frame-level report said so.
+    """
+    if df is None or GRIPPER_COL_GATED not in df.columns:
+        return
+    if COL_MOTION_SRC not in df.columns:
+        r.degrade(f"no {COL_MOTION_SRC} — cannot tell operator-driven frames from scripted ones")
+        return
+
+    g = pd.to_numeric(df[GRIPPER_COL_GATED], errors="coerce").fillna(0.0).to_numpy()
+    close = next((i for i in range(1, len(g)) if g[i - 1] < 0.5 <= g[i]), None)
+    release = next((i for i in range(len(g) - 1, 0, -1) if g[i] < g[i - 1] - 0.05), None)
+    if close is None or release is None or release <= close:
+        r.note("no complete grasp (close then release) — scripted-motion check skipped")
+        return
+
+    src = df[COL_MOTION_SRC].astype(str).str.strip().str.lower()
+    carry = src.iloc[close:release + 1]
+    hits = carry[carry.isin(SCRIPTED_SOURCES)]
+    if hits.empty:
+        r.note(f"carry frames {close}..{release} are operator-driven throughout "
+               f"({carry.nunique()} distinct motion_source)")
+        return
+
+    counts = hits.value_counts().to_dict()
+    pct = 100.0 * len(hits) / max(1, release - close + 1)
+    r.block(f"{len(hits)} scripted frame(s) ({pct:.1f}% of the carry) between grasp@{close} "
+            f"and release@{release}: {counts}. Under the end-to-end contract the operator "
+            f"drives the whole carry; a teach button moved the arm here, and the converter "
+            f"will drop this episode rather than teach the policy a motion it cannot predict")
+    if COL_ACTIVE_SEQ in df.columns:
+        seqs = sorted({s for s in df[COL_ACTIVE_SEQ].astype(str).str.strip().iloc[close:release + 1]
+                       if s and s.lower() not in ("nan", "none")})
+        if seqs:
+            r.note(f"active_sequence during the carry: {seqs} — note this cannot say WHICH "
+                   f"shelf, only that a route ran; the destination comes from the declaration")
+
+
 def check_meta(ep: pathlib.Path, r: Report) -> dict:
     f = ep / "episode_meta.json"
     if not f.is_file():
@@ -119,12 +171,17 @@ def check_meta(ep: pathlib.Path, r: Report) -> dict:
 
     side = resolved_target_side(meta)
     if not side:
-        r.block("no resolved target side — the converter reads resolved_target_side "
-                "(or target_shelf) and deliberately never reads the legacy static field")
+        r.block("no resolved target side — the operator pressed no teach button, so "
+                "nothing declares where this episode was meant to go")
     elif side not in CANONICAL_DESTINATIONS:
         r.block(f"resolved target side {side!r} not in {CANONICAL_DESTINATIONS}")
     else:
         r.note(f"resolved target side: {side!r}")
+    if (k := derived_only_target(meta)) is not None:
+        r.block(f"the only destination field is {k!r}, which is derived from the shelf "
+                f"labels and the category rather than declared by the operator. On a "
+                f"single-category batch that derivation returns the same shelf for every "
+                f"episode, so it is reported and not used")
     if (k := legacy_only_target(meta)) is not None:
         r.block(f"the only destination field is {k!r}; that names the DEFAULT arrangement, "
                 f"not this episode's, and promoting it is the migration that must not happen")
@@ -197,6 +254,7 @@ def main(args: Args) -> None:
     r = Report()
     print(f"checking {ep}\n")
     df = check_csv(ep, args.fps, r)
+    check_scripted_motion(df, r)
     check_meta(ep, r)
     check_images(ep, df, r)
 
