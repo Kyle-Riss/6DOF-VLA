@@ -94,6 +94,12 @@ GRIPPER_COL_GATED = "gripper_command"
 GRIPPER_COL_RAW = "gripper_trigger_raw"
 IMAGE_COL_HIK = "image_path_hik"
 IMAGE_COL_ZED = "image_path_zed"
+# A high-resolution crop of the three shelf signs, cropped from the full HIK
+# sensor rather than from the 224 base view. At 224 the signs measure ~12 px and
+# a word spans 1.4 SigLIP patches, so the base view cannot carry them however
+# many episodes are collected -- the information is gone at tokenisation. Absent
+# in pre-08-04 episodes, so the slot is optional and its presence is reported.
+IMAGE_COL_LABEL = "image_path_label"
 
 # Optional integrity columns — guards are skipped when a column is absent.
 COL_DT = "dt_from_prev"
@@ -269,8 +275,8 @@ INSERT_ENTER_MM = 300.0     # book length: the travel while the book crosses the
 RETRACT_EXIT_MM = 10.0      # reverse travel after release that counts as retracting
 
 
-def tasks_for(obj: str, tgt: str, schema: str) -> list[str]:
-    return render_phase_prompts(schema, obj, tgt)
+def tasks_for(obj: str, tgt: str, schema: str, cat: str, phase_style: str) -> list[str]:
+    return render_phase_prompts(schema, obj, tgt, cat=cat, style=phase_style)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +303,8 @@ from e7_prompt import (  # noqa: E402
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
     PHASE_NAMES,
-    PHASE_TEMPLATES,
+    PHASE_STYLES,
+    PHASE_TEMPLATE_SETS,
     render_phase_prompts,
     INCOMPLETE,
     PROMPT_TEMPLATES,
@@ -317,9 +324,12 @@ from e7_prompt import (  # noqa: E402
 PLANAR_NAMES = list(PHASE_NAMES["planar"])
 INSERTION_NAMES = list(PHASE_NAMES["insertion"])
 
+# Only the phase NAMES live here now. Which template family renders them is a
+# per-run choice (``--phase-style``), so pinning one here would silently ignore
+# the flag in the report while the dataset used the other.
 SCHEMAS = {
-    "planar": (list(PHASE_TEMPLATES["planar"]), PLANAR_NAMES),
-    "insertion": (list(PHASE_TEMPLATES["insertion"]), INSERTION_NAMES),
+    "planar": (list(PHASE_TEMPLATE_SETS["destination"]["planar"]), PLANAR_NAMES),
+    "insertion": (list(PHASE_TEMPLATE_SETS["destination"]["insertion"]), INSERTION_NAMES),
 }
 
 
@@ -403,7 +413,8 @@ def _report_category_destination_matrix(counts: dict[tuple[str, str], int]) -> N
 
 
 def _build_contract_manifest(
-    config_name: str, prompt_style: str, rule_tables: dict[str, dict[str, str]]
+    config_name: str, prompt_style: str, rule_tables: dict[str, dict[str, str]],
+    phase_style: str,
 ) -> dict:
     """Stamp the prompt contract, reading tokenizer settings from the train config.
 
@@ -424,6 +435,7 @@ def _build_contract_manifest(
                 max_token_len=int(model.max_token_len),
                 discrete_state_input=bool(model.discrete_state_input),
             ),
+            phase_style=phase_style,
             image_keys=tuple(model.image_keys),
             action_dim=int(model.action_dim),
             action_horizon=int(model.action_horizon),
@@ -436,6 +448,7 @@ def _build_contract_manifest(
         return {
             "prompt_contract_hash": None,
             "prompt_style": prompt_style,
+            "phase_style": phase_style,
             "rule_tables": rule_tables,
             "config_name": config_name,
             "error": str(exc),
@@ -1245,6 +1258,7 @@ def main(
     # --- prompt ------------------------------------------------------------
     prompt_source: Literal["rendered", "meta", "phase"] = "rendered",
     prompt_style: Literal["resolved", "category_only", "single_rule", "rule_table"] = "resolved",
+    phase_style: Literal["destination", "category"] = "destination",
     # Config the checkpoint will be trained under. Only read to stamp the prompt
     # contract manifest -- the tokenizer settings that change the token sequence
     # (max_token_len, discrete_state_input) live there, not here.
@@ -1288,6 +1302,14 @@ def main(
         schema: phase schema. ``auto`` picks ``insertion`` when
             episode_meta["task_id"] contains "insert", else ``planar``.
         prompt_style: rule clause used when ``prompt_source="rendered"``.
+        phase_style: which family of per-frame phase strings to emit, and the
+            manipulated variable of the main ablation. ``destination`` names the
+            shelf in carry/insert/retract, so the policy can reach it by reading
+            the text. ``category`` names the book's category instead and never
+            the shelf, so the destination can only come from the label signs in
+            the image. Only takes effect with ``prompt_source="phase"``; the
+            other sources overwrite every phase string with one episode-level
+            prompt.
             ``single_rule`` gives only the episode's own rule (the answer is right
             of the arrow), ``rule_table`` gives all three rows so the category must
             be matched, ``resolved`` names the destination and states no rule.
@@ -1354,6 +1376,24 @@ def main(
     h_hik, w_hik, _ = _load_image_hwc(episode_paths[0] / images_subdir / str(df0[IMAGE_COL_HIK].iloc[0]), resize).shape
     h_zed, w_zed, _ = _load_image_hwc(episode_paths[0] / images_subdir / str(df0[IMAGE_COL_ZED].iloc[0]), resize).shape
 
+    # Emitted only when EVERY episode has it. A dataset where some episodes carry
+    # the label view and others do not would train the policy to expect the slot
+    # and then hand it a blank, which is indistinguishable from a shelf with no
+    # signs -- so the mixed case is refused rather than padded.
+    label_eps = [ep for ep in episode_paths
+                 if IMAGE_COL_LABEL in _read_csv(ep, csv_name).columns]
+    use_label = bool(label_eps) and len(label_eps) == len(episode_paths)
+    if label_eps and not use_label:
+        missing = [ep.name for ep in episode_paths if ep not in label_eps]
+        raise SystemExit(
+            f"{len(label_eps)}/{len(episode_paths)} episodes have {IMAGE_COL_LABEL} but "
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''} do not. Convert the two "
+            f"groups separately -- a half-populated label slot is worse than none."
+        )
+    if use_label:
+        h_lab, w_lab, _ = _load_image_hwc(
+            episode_paths[0] / images_subdir / str(df0[IMAGE_COL_LABEL].iloc[0]), resize).shape
+
     features = {
         "exterior_image_1_left": {"dtype": "image", "shape": (h_hik, w_hik, 3),
                                   "names": ["height", "width", "channel"]},
@@ -1366,6 +1406,9 @@ def main(
         "next.reward": {"dtype": "float32", "shape": (1,), "names": None},
         "next.done":   {"dtype": "bool",    "shape": (1,), "names": None},
     }
+    if use_label:
+        features["label_image"] = {"dtype": "image", "shape": (h_lab, w_lab, 3),
+                                   "names": ["height", "width", "channel"]}
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id, fps=fps, robot_type=robot_type, features=features,
@@ -1689,7 +1732,15 @@ def main(
         # sentence that reads fine and names nowhere.
         tgt = resolved_target_side(meta)
         assert tgt, f"{ep.name}: phase prompts need a declared destination"
-        phase_tasks = tasks_for(obj, tgt, ep_schema)
+        # The destination is resolved even under phase_style="category", which
+        # does not print it. It is still needed to LABEL the demonstration (which
+        # shelf did the arm actually visit), and dropping the assert here would
+        # let an unlabelled episode through whenever the grounding style is on.
+        phase_cat = canonical_category(str(meta.get("category") or ""))
+        assert phase_style != "category" or phase_cat, (
+            f"{ep.name}: phase_style='category' puts the category in every prompt, "
+            f"but episode_meta['category'] is empty")
+        phase_tasks = tasks_for(obj, tgt, ep_schema, phase_cat, phase_style)
 
         # ``meta``  — episode_meta["prompt"], constant for the whole episode. This is
         #   the one that carries the MCP context ("category=physics. rule:
@@ -1799,6 +1850,8 @@ def main(
             dataset.add_frame({
                 "exterior_image_1_left": _load_image_hwc(ep / images_subdir / str(cur[IMAGE_COL_HIK]), resize),
                 "exterior_image_2_left": _load_image_hwc(ep / images_subdir / str(cur[IMAGE_COL_ZED]), resize),
+                **({"label_image": _load_image_hwc(
+                    ep / images_subdir / str(cur[IMAGE_COL_LABEL]), resize)} if use_label else {}),
                 "state": state,
                 "action": action,
                 "next.reward": np.array([1.0 if is_last else 0.0], dtype=np.float32),
@@ -1830,7 +1883,7 @@ def main(
     # recomputes the hash at startup and refuses to serve on a mismatch. Written
     # here rather than at train time because the rule tables are only knowable
     # once the episodes have been read.
-    manifest = _build_contract_manifest(config_name, prompt_style, rule_tables)
+    manifest = _build_contract_manifest(config_name, prompt_style, rule_tables, phase_style)
     (ctx_path.parent / "prompt_contract.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -1839,7 +1892,7 @@ def main(
             guard, all_actions, grip_values, gating_lags, fallback_eps,
             gcol, gripper_binarize, repo_id, action_semantics, clamp_mag, object_counts,
             schema_counts, insert_axes, prompt_source, prompt_counts, context_counts,
-            cat_dest_counts, prompt_style, rule_tables)
+            cat_dest_counts, prompt_style, phase_style, rule_tables)
 
     if push_to_hub:
         dataset.push_to_hub(tags=["e7", "xarm6", "openpi", "velocity", "phase-prompt"],
@@ -1851,7 +1904,7 @@ def _report(dataset, episode_paths, skipped_eps, total_frames, phase_counts, gua
             all_actions, grip_values, gating_lags, fallback_eps,
             gcol, gripper_binarize, repo_id, action_semantics, clamp_mag, object_counts,
             schema_counts, insert_axes, prompt_source, prompt_counts, context_counts,
-            cat_dest_counts, prompt_style, rule_tables) -> None:
+            cat_dest_counts, prompt_style, phase_style, rule_tables) -> None:
     print("\n" + "=" * 72)
     print("CONVERSION REPORT")
     print("=" * 72)
@@ -1882,9 +1935,24 @@ def _report(dataset, episode_paths, skipped_eps, total_frames, phase_counts, gua
     note = {
         "rendered": f"   (rendered here from enum fields, style={prompt_style})",
         "meta": "   (episode_meta['prompt'] verbatim — template owned by the collector)",
-        "phase": "   ⚠ per-phase strings — names the destination, no counterfactual possible",
+        "phase": f"   (per-frame phase strings, phase_style={phase_style})",
     }[prompt_source]
     print(f"\n  Prompt source  : {prompt_source}{note}")
+    if prompt_source == "phase":
+        if phase_style == "destination":
+            print("    ⚠ every carry/insert/retract string names the shelf, so the")
+            print("      destination can be read straight out of the text. This is the")
+            print("      manipulation upper bound, not the grounding condition — use")
+            print("      --phase-style category for that.")
+        else:
+            print("    Grounding condition: no phase string names a shelf, so the")
+            print("      destination can only come from the label signs in the image.")
+            print("      ⚠ Requires the label slot in image_keys — without it the")
+            print("      destination is unobservable and the episodes are unlearnable.")
+    elif phase_style != "destination":
+        print(f"    ⚠ --phase-style {phase_style} has NO EFFECT with prompt_source="
+              f"{prompt_source!r}:")
+        print("      the episode-level prompt overwrites every phase string.")
     if prompt_source == "rendered" and prompt_style in ("resolved", "single_rule"):
         print(f"    ⚠ {prompt_style} names the destination in the prompt, so the policy")
         print("      can reach the shelf by copying that token. This measures 'is the")

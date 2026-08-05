@@ -103,6 +103,25 @@ def canonical_category(raw: str) -> str:
     return CATEGORY_EN.get(raw.strip(), raw.strip())
 
 
+# How a category is SPELLED in a prompt, as opposed to how it is keyed.
+#
+# ``liberal_arts`` is the enum -- it indexes tables, filenames and report rows,
+# and an underscore keeps it one token in a CSV. It is the wrong thing to hand a
+# tokenizer: the shelf sign reads "Liberal Arts", and the whole task is matching
+# the words in the instruction against the words on that sign. Feeding the model
+# "liberal_arts" makes it match across a spelling it never sees in the image.
+#
+# Only the surface form differs. Anything that keys off a category still uses
+# the canonical value.
+CATEGORY_TEXT: dict[str, str] = {"liberal_arts": "liberal arts"}
+
+
+def category_text(raw: str) -> str:
+    """The prompt spelling of a category. Canonical form for everything else."""
+    cat = canonical_category(raw)
+    return CATEGORY_TEXT.get(cat, cat)
+
+
 # ---------------------------------------------------------------------------
 # Per-phase prompts
 # ---------------------------------------------------------------------------
@@ -150,6 +169,55 @@ PHASE_TEMPLATES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# The same phases with the destination removed and the CATEGORY kept.
+#
+# This is the label-grounding condition: the policy is told which book it is
+# holding and must find the matching shelf by reading the signs, so the shelf
+# must not appear in the text. The category has to stay -- it is the query, not
+# a shortcut. Drop it as well and the instruction says only "carry the book",
+# which no observation can disambiguate, and the episode becomes unlearnable
+# rather than harder.
+#
+# ``retract`` carries neither: by then the arm is at the shelf and its own pose
+# says which one, so naming it would put the answer back into the text for the
+# frames right after release.
+#
+# Held alongside the destination set rather than replacing it, because the two
+# are the manipulated variable of the main ablation and both have to be
+# renderable from one installed package.
+PHASE_TEMPLATES_CATEGORY: dict[str, tuple[str, ...]] = {
+    # planar names no destination to begin with -- "the target area" is one
+    # fixed spot, not one of three shelves -- so there is nothing to remove and
+    # the strings are shared. Keeping the key means a mixed batch still renders.
+    "planar": (
+        "approach the {obj}",
+        "pick up the {obj}",
+        "lift the {obj}",
+        "move the {obj} to the target area",
+        "place the {obj} in the target area",
+        "release the {obj}",
+    ),
+    "insertion": (
+        "approach the {cat} {obj}",
+        "grasp the {cat} {obj}",
+        "lift the {cat} {obj}",
+        "carry the {cat} {obj}",
+        "insert the {cat} {obj} into the shelf",
+        "release the {cat} {obj}",
+        "retract from the shelf",
+    ),
+}
+
+# Which family of phase strings a run uses. In the hash: it changes every
+# per-frame prompt, and a checkpoint trained under one and served under the
+# other is being asked a question it never saw.
+PHASE_STYLES: tuple[str, ...] = ("destination", "category")
+
+PHASE_TEMPLATE_SETS: dict[str, dict[str, tuple[str, ...]]] = {
+    "destination": PHASE_TEMPLATES,
+    "category": PHASE_TEMPLATES_CATEGORY,
+}
+
 PHASE_NAMES: dict[str, tuple[str, ...]] = {
     "planar": ("approach", "pick", "lift", "transport", "place", "release"),
     "insertion": ("approach", "grasp", "lift", "carry", "insert",
@@ -157,12 +225,24 @@ PHASE_NAMES: dict[str, tuple[str, ...]] = {
 }
 
 
-def render_phase_prompts(schema: str, obj: str, tgt: str) -> list[str]:
+def render_phase_prompts(
+    schema: str, obj: str, tgt: str, *, cat: str = "", style: str = "destination"
+) -> list[str]:
     """Every phase string for one episode, in phase order.
 
-    Raises on an unknown schema rather than defaulting: a silently wrong schema
-    produces prompts that read correctly and label the wrong frames.
+    Raises on an unknown schema or style rather than defaulting: either one
+    silently wrong produces prompts that read correctly and label the wrong
+    frames, which is the failure this package exists to make impossible.
     """
-    if schema not in PHASE_TEMPLATES:
-        raise KeyError(f"unknown phase schema {schema!r}; have {sorted(PHASE_TEMPLATES)}")
-    return [t.format(obj=obj, tgt=tgt) for t in PHASE_TEMPLATES[schema]]
+    if style not in PHASE_TEMPLATE_SETS:
+        raise KeyError(f"unknown phase style {style!r}; have {sorted(PHASE_TEMPLATE_SETS)}")
+    templates = PHASE_TEMPLATE_SETS[style]
+    if schema not in templates:
+        raise KeyError(f"unknown phase schema {schema!r}; have {sorted(templates)}")
+    if style == "category" and schema == "insertion" and not cat:
+        raise ValueError(
+            "phase style 'category' needs a category: it is the only thing left "
+            "in the prompt that identifies the destination"
+        )
+    return [t.format(obj=obj, tgt=tgt, cat=category_text(cat))
+            for t in templates[schema]]

@@ -17,6 +17,14 @@ def make_e7_example() -> dict:
     }
 
 
+def make_e7_label_example() -> dict:
+    """Input example for the 3-slot, label-grounded variant."""
+    return make_e7_example() | {
+        "observation/label_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "prompt": "carry the science book",
+    }
+
+
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
@@ -42,17 +50,26 @@ class E7Inputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         hik_image = _parse_image(data["observation/exterior_image_1_left"])
         zed_image = _parse_image(data["observation/exterior_image_2_left"])
+        # Present only for label-grounded runs. Its absence is what separates the
+        # 2-slot baseline from the 3-slot condition, and both are built from the
+        # same recorded episodes -- so this is a plain key check, not an error.
+        label_image = data.get("observation/label_image")
 
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
-                # HIK → base slot, ZED → left_wrist slot. Unlike E6, ``right_wrist_0_rgb``
-                # is NOT emitted: xArm6 has no third camera, and a zeros+mask-False slot
-                # still costs 256 sequence tokens and a full SigLIP forward while
-                # contributing nothing. Requires the matching ``image_keys`` on
+                # HIK → base slot, ZED → left_wrist slot. Unlike E6, an empty
+                # third slot is NOT emitted: a zeros+mask-False slot still costs
+                # 256 sequence tokens and a full SigLIP forward while
+                # contributing nothing. When a label view IS supplied it takes
+                # that slot for real. Requires the matching ``image_keys`` on
                 # :class:`Pi0Config` (see ``pi05_e7_v1_lora``).
                 names = ("base_0_rgb", "left_wrist_0_rgb")
                 images = (hik_image, zed_image)
                 image_masks = (np.True_, np.True_)
+                if label_image is not None:
+                    names += ("right_wrist_0_rgb",)
+                    images += (_parse_image(label_image),)
+                    image_masks += (np.True_,)
             case _model.ModelType.PI0_FAST:
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
                 images = (hik_image, zed_image, np.zeros_like(hik_image))

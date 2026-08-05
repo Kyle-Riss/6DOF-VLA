@@ -522,20 +522,28 @@ class LeRobotE7DataConfig(DataConfigFactory):
     (measured on v23), so there is nothing to gain from realigning here.
     """
 
+    # Feed the dedicated shelf-label view into the third image slot.
+    #
+    # This is the manipulated variable of the main ablation, not a convenience:
+    # the 2-slot and 3-slot conditions are trained from the SAME converted
+    # dataset and differ only here (plus the matching ``image_keys`` on the
+    # model). Leaving it False on a dataset that has ``label_image`` silently
+    # drops the column, which is exactly the 2-slot baseline.
+    use_label_view: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack = {
+            "observation/exterior_image_1_left": "exterior_image_1_left",
+            "observation/exterior_image_2_left": "exterior_image_2_left",
+            "observation/state": "state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if self.use_label_view:
+            repack["observation/label_image"] = "label_image"
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/state": "state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack)]
         )
         data_transforms = _transforms.Group(
             inputs=[e7_policy.E7Inputs(model_type=model_config.model_type)],
@@ -2373,6 +2381,60 @@ _CONFIGS = [
         # warmup must stay below decay_steps — optax subtracts one from the other,
         # and the default 1000-step warmup would make decay_steps negative here.
         lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, decay_steps=100),
+        freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
+        ema_decay=None,
+    ),
+    #
+    # E7 label-grounded — the main proposed condition.
+    #
+    # Identical to pi05_e7_v1_lora except for the two lines that ARE the
+    # experiment: the dedicated shelf-label view occupies a third image slot, and
+    # the prompt never names a shelf. Convert with
+    #   --prompt-source phase --phase-style category
+    # so every per-frame string carries the book's category and no destination;
+    # the shelf can then only come from reading the signs in the label view.
+    #
+    # The 2-slot baseline is this config with use_label_view=False and two
+    # image_keys, trained on the SAME dataset -- the ablation costs no extra
+    # collection, only another run.
+    #
+    # ⚠ Requires episodes collected under MORE THAN ONE shelf layout. Under a
+    # single layout the sign and the position are perfectly correlated, so
+    # "reads the sign" and "always goes to the same place" fit the data equally
+    # well and nothing here can separate them. The converter reports the number
+    # of layouts seen; if it says 1, this config measures nothing.
+    #
+    # Sequence 728 → 984 (three SigLIP forwards instead of two).
+    #
+    TrainConfig(
+        name="pi05_e7_grounded_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora_r16",
+            vision_lora_rank=16,
+            vision_lora_alpha=16.0,
+            vision_lora_layer_range=(18, 26),
+            action_expert_lora_layer_range=None,
+            wrist_image_keys=(),
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotE7DataConfig(
+            repo_id="local/e7_books_v1",
+            use_label_view=True,
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir="assets/pi05_e7_grounded_lora", asset_id="local/e7_books_v1"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=8,
+        log_interval=50,
+        save_interval=2500,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
         freeze_filter=pi0_config.freeze_filter_v4_combined_lora(),
         ema_decay=None,
     ),

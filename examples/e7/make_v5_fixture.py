@@ -34,7 +34,8 @@ CATEGORIES = ("science", "liberal_arts", "humanities")
 
 # Written in the collector's order so a diff against a real file lines up.
 CSV_COLS = (
-    ["frame_id", "timestamp", "timestamp_monotonic", "image_path_hik", "image_path_zed"]
+    ["frame_id", "timestamp", "timestamp_monotonic",
+     "image_path_hik", "image_path_zed", "image_path_label"]
     + [f"j{i}" for i in range(1, 7)]
     + ["x", "y", "z", "rx", "ry", "rz",
        "gripper_command", "gripper_trigger_raw", "teleop_enabled", "robot_mode",
@@ -70,8 +71,8 @@ def _episode(root: pathlib.Path, idx: int, args: Args) -> None:
     rng = np.random.default_rng(1000 + idx)
     n, dt = args.frames, 1.0 / args.fps
     ep = root / str(idx)
-    (ep / "images" / "hik").mkdir(parents=True, exist_ok=True)
-    (ep / "images" / "zed").mkdir(parents=True, exist_ok=True)
+    for cam in ("hik", "zed", "label"):
+        (ep / "images" / cam).mkdir(parents=True, exist_ok=True)
 
     # Category -> shelf assignment. Rotating it is what makes the sign, rather than
     # the category token, the only thing that could predict the destination.
@@ -104,12 +105,13 @@ def _episode(root: pathlib.Path, idx: int, args: Args) -> None:
     img = Image.fromarray(rng.integers(60, 190, (224, 224, 3), dtype=np.uint8))
     rows = []
     for k in range(n):
-        for cam in ("hik", "zed"):
+        for cam in ("hik", "zed", "label"):
             img.save(ep / "images" / cam / f"frame_{k:06d}.jpg", quality=88)
         rows.append({
             "frame_id": k, "timestamp": 1785500000.0 + k * dt, "timestamp_monotonic": k * dt,
             "image_path_hik": f"hik/frame_{k:06d}.jpg",
             "image_path_zed": f"zed/frame_{k:06d}.jpg",
+            "image_path_label": f"label/frame_{k:06d}.jpg",
             **{f"j{i+1}": joints[k, i] for i in range(6)},
             "x": 300.0, "y": -180.0, "z": 200.0, "rx": 180.0, "ry": 0.0, "rz": 0.0,
             "gripper_command": grip[k], "gripper_trigger_raw": grip[k],
@@ -154,6 +156,10 @@ def _episode(root: pathlib.Path, idx: int, args: Args) -> None:
         "command_semantics": "cartesian_twist",
         "fps": args.fps, "num_frames": n,
         "category": category, "category_source": "manual", "category_confirmed": True,
+        # The converter refuses to invent an object name -- "approach the
+        # science_001" would put a book id straight into the tokenizer -- so the
+        # fixture has to carry the same field the collector writes.
+        "prompt_object_name": "book",
         "labels_source": "manual",
         # v5 canonical destination. No `target_shelf_id`: that field is gone, and a
         # fixture that still emitted it would test the wrong thing.

@@ -17,6 +17,7 @@ from .templates import (
     PROMPT_TEMPLATES,
     STYLES_NEEDING_TARGET,
     canonical_category,
+    category_text,
 )
 
 
@@ -46,16 +47,22 @@ class ContextSpec:
 
 
 def render_prompt(spec: ContextSpec) -> str:
-    """Render the prompt string. Deterministic, pure, no I/O."""
+    """Render the prompt string. Deterministic, pure, no I/O.
+
+    The category reaches the text as its prompt spelling ("liberal arts") while
+    tables stay keyed on the canonical enum ("liberal_arts"); see
+    :func:`~e7_prompt.templates.category_text`.
+    """
     cat = canonical_category(spec.category)
     tgt = spec.target.strip()
     if not cat:
         raise ValueError("ContextSpec.category is empty")
+    cat_txt = category_text(cat)
 
     if spec.prompt_style == "category_only":
         # `target` stays optional here: at inference the classifier returns a
         # category and nothing else, which is the whole point of this style.
-        return PROMPT_TEMPLATES["category_only"].format(cat=cat)
+        return PROMPT_TEMPLATES["category_only"].format(cat=cat_txt)
 
     if not tgt:
         raise ValueError(
@@ -73,10 +80,10 @@ def render_prompt(spec: ContextSpec) -> str:
         # Rows go in a FIXED canonical order -- sorted by category name, never
         # with the episode's own category first. Otherwise "read row 1" is a
         # shortcut that defeats the whole manipulation.
-        rows = ", ".join(f"{c}->{table[c]}" for c in sorted(table))
-        return PROMPT_TEMPLATES["rule_table"].format(cat=cat, tgt=tgt, table=rows)
+        rows = ", ".join(f"{category_text(c)}->{table[c]}" for c in sorted(table))
+        return PROMPT_TEMPLATES["rule_table"].format(cat=cat_txt, tgt=tgt, table=rows)
 
-    return PROMPT_TEMPLATES[spec.prompt_style].format(cat=cat, tgt=tgt)
+    return PROMPT_TEMPLATES[spec.prompt_style].format(cat=cat_txt, tgt=tgt)
 
 
 def render_from_meta(

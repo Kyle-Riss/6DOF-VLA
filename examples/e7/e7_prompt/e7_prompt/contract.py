@@ -23,13 +23,15 @@ from collections.abc import Mapping
 from .templates import (
     CANONICAL_CATEGORIES,
     CANONICAL_DESTINATIONS,
-    PHASE_TEMPLATES,
+    CATEGORY_TEXT,
+    PHASE_STYLES,
+    PHASE_TEMPLATE_SETS,
     CATEGORY_EN,
     RIG_LAYOUT,
     PROMPT_TEMPLATES,
 )
 
-CONTRACT_VERSION = "1.1.0"
+CONTRACT_VERSION = "1.2.0"
 
 # PaliGemma tokenizer as pinned by openpi. Bump only if the tokenizer artefact
 # itself changes -- the value is opaque, it just has to differ when the
@@ -59,6 +61,8 @@ def contract_payload(
     prompt_style: str,
     rule_tables: Mapping[str, Mapping[str, str]],
     tokenizer: TokenizerSpec,
+    *,
+    phase_style: str,
 ) -> dict:
     """The exact object that gets hashed. Kept public so a mismatch is debuggable.
 
@@ -72,12 +76,23 @@ def contract_payload(
     ``rule_tables`` is still accepted so callers need not change, but it only
     contributes its key set — the versions present, not what they map to.
     """
+    if phase_style not in PHASE_STYLES:
+        raise ValueError(f"unknown phase_style {phase_style!r}; expected one of {PHASE_STYLES}")
     return {
         "contract_version": CONTRACT_VERSION,
         "prompt_style": prompt_style,
+        "phase_style": phase_style,
         "templates": dict(sorted(PROMPT_TEMPLATES.items())),
-        "phase_templates": {k: list(v) for k, v in sorted(PHASE_TEMPLATES.items())},
+        # Both families are hashed, not just the selected one. Editing the set a
+        # run does not use still has to invalidate the checkpoint: the two are
+        # the manipulated variable of the main ablation, and a comparison across
+        # them is only meaningful if neither moved underneath it.
+        "phase_templates": {
+            style: {k: list(v) for k, v in sorted(tmpl.items())}
+            for style, tmpl in sorted(PHASE_TEMPLATE_SETS.items())
+        },
         "category_map": dict(sorted(CATEGORY_EN.items())),
+        "category_text": dict(sorted(CATEGORY_TEXT.items())),
         "categories": sorted(CANONICAL_CATEGORIES),
         "destinations": sorted(CANONICAL_DESTINATIONS),
         "rig_layout": dict(sorted(RIG_LAYOUT.items())),
@@ -94,10 +109,12 @@ def compute_contract_hash(
     prompt_style: str,
     rule_tables: Mapping[str, Mapping[str, str]],
     tokenizer: TokenizerSpec,
+    *,
+    phase_style: str,
 ) -> str:
     """Stable 16-hex-char digest of the full prompt contract."""
     blob = json.dumps(
-        contract_payload(prompt_style, rule_tables, tokenizer),
+        contract_payload(prompt_style, rule_tables, tokenizer, phase_style=phase_style),
         sort_keys=True,
         ensure_ascii=True,
         separators=(",", ":"),
@@ -110,6 +127,8 @@ def verify_contract(
     prompt_style: str,
     rule_tables: Mapping[str, Mapping[str, str]],
     tokenizer: TokenizerSpec,
+    *,
+    phase_style: str,
 ) -> list[str]:
     """Compare runtime context against a checkpoint's manifest.
 
@@ -127,12 +146,17 @@ def verify_contract(
     if not expected:
         return ["MISSING_CONTRACT_HASH: manifest has no prompt_contract_hash"]
 
-    actual = compute_contract_hash(prompt_style, rule_tables, tokenizer)
+    actual = compute_contract_hash(prompt_style, rule_tables, tokenizer, phase_style=phase_style)
     if actual == expected:
         return []
 
     if (m := manifest.get("prompt_style")) != prompt_style:
         problems.append(f"prompt_style: checkpoint={m!r} runtime={prompt_style!r}")
+    if (m := manifest.get("phase_style", "destination")) != phase_style:
+        problems.append(
+            f"phase_style: checkpoint={m!r} runtime={phase_style!r} — one names the "
+            "shelf in every phase string and the other does not"
+        )
 
     for key, live in (
         ("categories", sorted(CANONICAL_CATEGORIES)),
@@ -174,6 +198,7 @@ def build_manifest(
     rule_tables: Mapping[str, Mapping[str, str]],
     tokenizer: TokenizerSpec,
     *,
+    phase_style: str,
     image_keys: tuple[str, ...],
     action_dim: int,
     action_horizon: int,
@@ -186,9 +211,11 @@ def build_manifest(
     """
     image_tokens = 256 * len(image_keys)
     return {
-        "prompt_contract_hash": compute_contract_hash(prompt_style, rule_tables, tokenizer),
+        "prompt_contract_hash": compute_contract_hash(
+            prompt_style, rule_tables, tokenizer, phase_style=phase_style),
         "contract_version": CONTRACT_VERSION,
         "prompt_style": prompt_style,
+        "phase_style": phase_style,
         "categories": sorted(CANONICAL_CATEGORIES),
         "destinations": sorted(CANONICAL_DESTINATIONS),
         "rig_layout": dict(sorted(RIG_LAYOUT.items())),
